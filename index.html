@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Phigros 模拟器</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+            -webkit-tap-highlight-color: transparent;
+            -webkit-user-select: none;
+            user-select: none;
+            touch-action: manipulation;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        }
+        
+        #loading-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            color: white;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            transition: opacity 0.3s;
+        }
+        
+        #loading-progress {
+            width: 80%;
+            max-width: 300px;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 2px;
+            margin: 20px 0;
+            overflow: hidden;
+        }
+        
+        #loading-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #ff3366, #ff9966);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        
+        #loading-text {
+            margin-top: 20px;
+            font-size: 16px;
+            color: #aaa;
+        }
+        
+        #start-screen {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.9);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 900;
+            text-align: center;
+        }
+        
+        #start-title {
+            font-size: 36px;
+            font-weight: bold;
+            margin-bottom: 20px;
+            background: linear-gradient(45deg, #ff3366, #ff9966);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            text-shadow: 0 2px 10px rgba(255, 51, 102, 0.3);
+        }
+        
+        #start-button {
+            margin-top: 40px;
+            padding: 16px 32px;
+            font-size: 20px;
+            background: linear-gradient(45deg, #ff3366, #ff9966);
+            border: none;
+            border-radius: 50px;
+            color: white;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            box-shadow: 0 4px 20px rgba(255, 51, 102, 0.4);
+        }
+        
+        #start-button:active {
+            transform: scale(0.95);
+            box-shadow: 0 2px 10px rgba(255, 51, 102, 0.2);
+        }
+        
+        #main-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+            z-index: 1;
+        }
+        
+        #debug-info {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 5px 10px;
+            border-radius: 5px;
+            z-index: 100;
+            display: none;
+        }
+        
+        #offset-toggle {
+            position: fixed;
+            right: 10px;
+            bottom: 10px;
+            z-index: 950;
+            padding: 8px 14px;
+            font-family: inherit;
+            font-size: 14px;
+            color: #fff;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.25);
+            border-radius: 20px;
+        }
+        
+        #offset-panel {
+            position: fixed;
+            right: 10px;
+            bottom: 58px;
+            z-index: 950;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            padding: 10px;
+            color: #fff;
+            font-size: 13px;
+            background: rgba(20, 20, 26, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            border-radius: 12px;
+            cursor: move;
+            touch-action: none;
+        }
+        
+        #offset-value {
+            padding: 2px 0;
+            text-align: center;
+            color: #ffcc66;
+        }
+        
+        .offset-row {
+            display: flex;
+            gap: 6px;
+        }
+        
+        .offset-row button,
+        #offset-reset {
+            flex: 1;
+            padding: 8px 10px;
+            font-family: inherit;
+            font-size: 13px;
+            color: #fff;
+            background: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 8px;
+        }
+        
+        #offset-toggle:active,
+        .offset-row button:active,
+        #offset-reset:active {
+            background: rgba(255, 90, 130, 0.55);
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div id="loading-screen">
+        <h1>Phigros 模拟器</h1>
+        <div id="loading-progress">
+            <div id="loading-bar"></div>
+        </div>
+        <div id="loading-text">正在加载资源...</div>
+    </div>
+    
+    <div id="start-screen" class="hidden">
+        <p>点击下方按钮开始游戏</p>
+        <button id="start-button">开始游戏</button>
+    </div>
+    
+    <canvas id="main-canvas"></canvas>
+    <div id="debug-info"></div>
+    
+    <button id="offset-toggle">偏移</button>
+
+    <div id="offset-panel" class="hidden">
+        <div id="offset-value">偏移 0 ms</div>
+        <div class="offset-row">
+            <button data-delta="-50">-50</button>
+            <button data-delta="-10">-10</button>
+            <button data-delta="-1">-1</button>
+        </div>
+        <div class="offset-row">
+            <button data-delta="1">+1</button>
+            <button data-delta="10">+10</button>
+            <button data-delta="50">+50</button>
+        </div>
+        <button id="offset-reset">重置</button>
+    </div>
+
+    <audio id="bgm" preload="auto"></audio>
+    
+    <script src="main.js"></script>
+</body>
+</html>
