@@ -1,3 +1,0 @@
-
-cancel = Batal
-confirm = Hapus
