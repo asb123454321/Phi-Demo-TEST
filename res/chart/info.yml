@@ -1,0 +1,24 @@
+name: "ハテ"
+difficulty: 17.9
+level: "AT Lv.17"
+charter: "the end of what."
+composer: "rN || Frums"
+illustrator: "Phigros"
+chart: "谱的名字.json（是extra.json则忽略不作为谱面文件）"
+format: null
+music: "音乐名称.ogg"
+illustration: "图片名称.png"
+unlockVideo: null
+previewStart: 0.0
+previewEnd: 20.0
+aspectRatio: 1.7777778
+backgroundDim: 0.6
+lineLength: 6.0
+offset: 0.0
+tip: null
+tags: []
+intro: "Phigros"
+holdPartialCover: false
+created: null
+updated: null
+chartUpdated: null

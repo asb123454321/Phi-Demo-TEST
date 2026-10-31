@@ -1,0 +1,2 @@
+notes 1397, lines 66, bpm 220.5, pec_beat = time/32
+完整导出（含判定线）: chart_phira_full.pec
