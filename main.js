@@ -20,6 +20,8 @@ const C = {
     hit_fx_imgs: []
 };
 
+window.__main_loaded = true;   // 告诉 index.html 的探针：main.js 已经开始执行了
+
 const cv = document.querySelector("#main-canvas");
 const ctx = cv.getContext("2d");
 
@@ -107,6 +109,15 @@ class BlockArea {
     active(t) { return t >= this.enableTime && t < this.disableTime; }
     visible(t) { return t >= this.appearTime && t < this.disappearTime; }
     ready(t) { return t >= (this.enableTime - 0.5) && t < this.enableTime; }
+
+    // 淡入：appear → enable 之间 0→1（Phira 同款，噪域会先淡淡出现再开始挡手）
+    fade(t) {
+        if (!this.active(t) && !this.ready(t) && t < this.enableTime) {
+            return Math.max(0, Math.min(1, (t - this.appearTime) / 0.5));
+        }
+
+        return 1;
+    }
 
     pose(t, aspect) {
         const lo = this.bottomLeftPercentage;
@@ -227,6 +238,19 @@ class NoiseAreaState {
         this.positions = [];
         for (const h of this.hovers) { h.finger = null; h.scale = 0; h.target = 0; h.elapsed = 0; }
     }
+    // 与 Phira 一致：闩锁跟的是“这次接触”，不是可复用的 pointer id
+    // 新按下 / 抬起 / 取消 都要清掉这根手指的闩锁（并让 hover 指示收缩消失）
+    release_finger(id) {
+        this.blockedIds.delete(id);
+
+        for (const h of this.hovers) {
+            if (h.finger === id) {
+                h.finger = null;
+                h.target = 0;
+                h.elapsed = 0;
+            }
+        }
+    }
     update(areas, touches, t, w, h, ox, oy, enabled, dt) {
         if (!enabled) { this.clear(); return; }
         const presentIds = new Set(touches.map(tt => tt.id));
@@ -266,7 +290,40 @@ class NoiseAreaState {
 
 const noiseState = new NoiseAreaState();
 let noiseAreas = [];
+
+// 点到噪域时的红色提示（在渲染层画、自动过期）
+// —— 以前是直接在 pointerdown 里画到主画布上，主界面（渲染循环没跑）时圆圈会永久残留
+const block_feedback = [];
+const BLOCK_FEEDBACK_TIME = 0.3;   // 秒
 let noiseEnabled = true;
+
+// ---- 「显示噪域编号」开关（主界面设置面板里切换，状态记在 localStorage）----
+const NOISE_INDEX_KEY = "phigros_noise_index";
+let show_noise_index = false;
+
+try {
+    show_noise_index = localStorage.getItem(NOISE_INDEX_KEY) === "1";
+} catch (e) {}
+
+const noise_index_btn = document.querySelector("#noise-index-toggle");
+
+const set_noise_index = on => {
+    show_noise_index = !!on;
+
+    if (noise_index_btn) {
+        noise_index_btn.textContent = `噪域编号：${show_noise_index ? "开" : "关"}`;
+    }
+
+    try {
+        localStorage.setItem(NOISE_INDEX_KEY, show_noise_index ? "1" : "0");
+    } catch (e) {}
+};
+
+if (noise_index_btn) {
+    noise_index_btn.onclick = () => set_noise_index(!show_noise_index);
+}
+
+set_noise_index(show_noise_index);
 
 // parse blockAreaList from chart data
 function parseBlockAreasFromChart(chartData) {
@@ -277,14 +334,23 @@ function parseBlockAreasFromChart(chartData) {
 
 // active pointer tracking
 const activePointers = new Map();
+const pointer_origin = new Map();   // 每个手指的按下点（识别滑动手势用）
 let lastFrameTime = performance.now();
 
 // pointerdown block check
 window.addEventListener('pointerdown', ev => {
     const rect = cv.getBoundingClientRect();
-    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+    // 画布内部分辨率可能高于 CSS 尺寸（高清缩放），统一换算成画布坐标
+    const sx = rect.width ? cv.width / rect.width : 1;
+    const sy = rect.height ? cv.height / rect.height : 1;
+    const px = (ev.clientX - rect.left) * sx, py = (ev.clientY - rect.top) * sy;
 
     activePointers.set(ev.pointerId, [px, py]);
+    pointer_origin.set(ev.pointerId, [px, py]);   // 记录按下点，用来识别“滑动”手势
+
+    // 新按下：清掉这根手指上一次的噪域闩锁（Phira 同款行为），
+    // 否则 pointer id 被复用时会把上一次的“被挡住”状态带过来
+    noiseState.release_finger(ev.pointerId);
 
     const sw = cv.width, sh = cv.height;
     const w = (sw / sh > 16 / 9) ? (sh * 16 / 9) : sw;
@@ -293,81 +359,148 @@ window.addEventListener('pointerdown', ev => {
 
     if (px < ox || px > ox + w || py < oy || py > oy + h) return;
 
+    // 只有在真正游玩时才响应：否则（主界面 / 已返回主界面）画面上是上一帧的残留，
+    // 点下去会画出永远擦不掉的痕迹
+    if (!running) return;
+
+    // 左上角暂停按钮优先级最高：暂停 / 继续
+    if (in_pause_button(px - ox, py - oy, w, h)) {
+        set_paused(!paused);
+        ev.preventDefault();
+        ev.stopPropagation();
+        return;
+    }
+
+    if (paused) {
+        // 暂停菜单：继续 / 返回主界面
+        const lx = px - ox, ly = py - oy;
+        const btn = pause_menu_buttons(w, h).find(b =>
+            lx >= b.x && lx <= b.x + b.w && ly >= b.y && ly <= b.y + b.h);
+
+        if (btn) {
+            if (btn.action === "resume") {
+                set_paused(false);
+            } else {
+                goto_menu();
+            }
+
+            ev.preventDefault();
+            ev.stopPropagation();
+        }
+
+        return;   // 暂停中：不判定，也不处理噪域
+    }
+
     const t = C.chart?.music?.currentTime ?? 0;
+
+    // 点到噪域：只记一条短期提示（由渲染层画、自动过期），不再直接画在主画布上
+    // —— 直接画的话，在主界面/返回主界面后渲染循环没跑，圆圈会永久残留
     if (blocked(noiseAreas, px, py, t, w, h, ox, oy)) {
-        ctx.save();
-        ctx.fillStyle = 'rgba(255,100,100,0.9)';
-        ctx.beginPath();
-        ctx.arc(px, py, 10, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
+        block_feedback.push({ x: px - ox, y: py - oy, until: performance.now() / 1000 + BLOCK_FEEDBACK_TIME });
 
         ev.preventDefault();
         ev.stopPropagation();
         return;
     }
+
+    // 手动游玩：点按只判 Tap / Hold（Drag 靠按住、Flick 靠滑动）
+    if (!autoplay && C.chart?.music) {
+        const chart_t = C.chart.music.currentTime - (C.chart.data.offset + offset_ms / 1000);
+        judge_tap(px - ox, py - oy, chart_t, w, h);
+    }
 });
 
 window.addEventListener('pointermove', ev => {
     const rect = cv.getBoundingClientRect();
-    const px = ev.clientX - rect.left, py = ev.clientY - rect.top;
+    const px = (ev.clientX - rect.left) * (rect.width ? cv.width / rect.width : 1);
+    const py = (ev.clientY - rect.top) * (rect.height ? cv.height / rect.height : 1);
     if (activePointers.has(ev.pointerId)) activePointers.set(ev.pointerId, [px, py]);
+
+    // 滑动判定：手指从按下点移动够远就算一次“划”，用来打 Flick（红键）
+    if (autoplay || paused || !pointer_origin.has(ev.pointerId) || !C.chart?.music) return;
+
+    const origin = pointer_origin.get(ev.pointerId);
+    const sw = cv.width, sh = cv.height;
+    const w = (sw / sh > 16 / 9) ? (sh * 16 / 9) : sw;
+    const h = (sw / sh > 16 / 9) ? sh : (sw * 9 / 16);
+    const ox = (sw - w) / 2, oy = (sh - h) / 2;
+
+    if (px < ox || px > ox + w || py < oy || py > oy + h) return;
+    if (Math.hypot(px - origin[0], py - origin[1]) < Math.max(24, h * 0.09)) return;
+
+    const chart_t = C.chart.music.currentTime - (C.chart.data.offset + offset_ms / 1000);
+
+    // 这根手指被噪域挡住（闩锁）或当前就落在噪域里 → 整根手指无效，不判 Flick
+    if (noiseState.isBlocked(ev.pointerId) || blocked(noiseAreas, px, py, chart_t, w, h, ox, oy)) return;
+
+    judge_flick([origin[0] - ox, origin[1] - oy], [px - ox, py - oy], chart_t, w, h);
 });
+const drop_pointer = ev => {
+    activePointers.delete(ev.pointerId);
+    pointer_origin.delete(ev.pointerId);
+    noiseState.release_finger(ev.pointerId);   // 抬起 / 取消：释放噪域闩锁
+};
 
-window.addEventListener('pointerup', ev => { activePointers.delete(ev.pointerId); });
-window.addEventListener('pointercancel', ev => { activePointers.delete(ev.pointerId); });
+window.addEventListener('pointerup', drop_pointer);
+window.addEventListener('pointercancel', drop_pointer);
 
-// render block areas
+// render block areas：噪域的实际绘制在 js/noise_render.js + js/noise_shader.js
 function renderBlockAreas(ctx, areas, t, w, h, ox, oy) {
     if (!areas || areas.length === 0) return;
 
-    const drawPose = (mctx, pose) => {
-        const corners = [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]].map(([x, y]) => {
-            const offset = rotatePoint([x * pose.size[0], y * pose.size[1]], pose.angle);
-            return worldToPixel([pose.center[0] + offset[0], pose.center[1] + offset[1]], w, h);
-        });
-        mctx.beginPath();
-        mctx.moveTo(corners[0][0], corners[0][1]);
-        for (let i = 1; i < corners.length; i++) mctx.lineTo(corners[i][0], corners[i][1]);
-        mctx.closePath();
-        mctx.fill();
-    };
+    // 防呆：万一 js/noise_render.js 没加载成功（比如打包时漏了 js 目录），
+    // 这里静默跳过噪域绘制，而不是每帧抛错把整个渲染循环打断
+    const noise_t0 = performance.now();
 
-    const mask = document.createElement('canvas');
-    mask.width = Math.ceil(w);
-    mask.height = Math.ceil(h);
-    const mctx = mask.getContext('2d');
-    mctx.clearRect(0, 0, mask.width, mask.height);
-
-    mctx.save();
-    for (const area of areas) {
-        if (!area.visible(t) || area.isSubtract) continue;
-        const p = area.pose(t, w / h);
-        mctx.fillStyle = 'rgba(255,0,0,0.75)';
-        drawPose(mctx, p);
+    if (typeof render_noise_areas === "function") {
+        render_noise_areas(ctx, noiseState, areas, t, w, h, ox, oy);
     }
 
-    mctx.globalCompositeOperation = 'destination-out';
-    for (const area of areas) {
-        if (!area.visible(t) || !area.isSubtract) continue;
-        const p = area.pose(t, w / h);
-        mctx.fillStyle = 'rgba(0,0,0,1)';
-        drawPose(mctx, p);
-    }
-    mctx.restore();
+    noise_ms = noise_ms * 0.8 + (performance.now() - noise_t0) * 0.2;   // 平滑后的耗时
 
-    ctx.save();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.drawImage(mask, 0, 0);
-    ctx.restore();
+    // 点到噪域的红色提示：0.3 秒内扩散淡出（画在渲染层 → 会自动过期，不会残留）
+    const now_s = performance.now() / 1000;
 
-    for (let i = 0; i < noiseState.positions.length && i < 10; i++) {
-        const pos = noiseState.positions[i];
+    for (let i = block_feedback.length - 1; i >= 0; i--) {
+        const fb = block_feedback[i];
+        const age = 1 - (fb.until - now_s) / BLOCK_FEEDBACK_TIME;
+
+        if (age >= 1) {
+            block_feedback.splice(i, 1);
+            continue;
+        }
+
         ctx.save();
-        ctx.fillStyle = 'rgba(255,255,255,0.08)';
+        ctx.globalAlpha = Math.max(0, 1 - age);
+        ctx.fillStyle = "rgba(255, 100, 100, 0.9)";
         ctx.beginPath();
-        ctx.arc(pos[0] - ox, pos[1] - oy, Math.min(w, h) * 0.06, 0, Math.PI * 2);
+        ctx.arc(fb.x, fb.y, Math.min(w, h) * 0.028 * (0.7 + age * 0.8), 0, Math.PI * 2);
         ctx.fill();
+        ctx.restore();
+    }
+
+    // 噪域编号（设置面板里打开「噪域编号」时显示，编号 = blockAreaList 里的下标）
+    if (show_noise_index) {
+        ctx.save();
+        ctx.font = `${Math.max(11, Math.round(Math.min(w, h) * 0.05))}px ${canvas_font_family}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = "rgba(0, 0, 0, 0.85)";
+
+        for (let i = 0; i < areas.length; i++) {
+            const area = areas[i];
+            if (!area.visible(t)) continue;
+
+            const p = area.pose(t, w / h);
+            const [cx, cy] = worldToPixel([p.center[0], p.center[1]], w, h);
+            const label = `${area.isSubtract ? "−" : ""}${i}`;
+
+            ctx.strokeText(label, cx, cy);
+            ctx.fillStyle = area.isSubtract ? "#ff9f43" : "#ffe066";
+            ctx.fillText(label, cx, cy);
+        }
+
         ctx.restore();
     }
 }
@@ -376,9 +509,14 @@ function renderBlockAreas(ctx, areas, t, w, h, ox, oy) {
 
 // 去顶栏/屏幕旋转过程中 window.innerWidth 可能瞬时为 0，
 // 这里以 canvas 实际显示尺寸为准，并跳过非法值（否则画布会变成 0×0，画面全黑）
+// 画布内部分辨率 = CSS 尺寸 × devicePixelRatio：
+// CSS 显示尺寸不变，但位图分辨率提高，文字/音符不会再被屏幕放大而发虚（强制高清）
+const MAX_DPR = 2;   // 上限；低端机想保帧率可降到 1.5，想更极致可提到 3
+
 const resize_canvas = () => {
-    const w = cv.clientWidth || window.innerWidth || document.body.clientWidth;
-    const h = cv.clientHeight || window.innerHeight || document.body.clientHeight;
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    const w = Math.round((cv.clientWidth || window.innerWidth || document.body.clientWidth) * dpr);
+    const h = Math.round((cv.clientHeight || window.innerHeight || document.body.clientHeight) * dpr);
 
     if (w > 0 && h > 0 && (cv.width !== w || cv.height !== h)) {
         cv.width = w;
@@ -387,7 +525,7 @@ const resize_canvas = () => {
 };
 const actx = new (window.AudioContext || window.webkitAudioContext)();
 
-const TOTAL_STEPS = 17;
+const TOTAL_STEPS = 18;
 let loaded_steps = 0;
 
 const set_progress = (msg, fraction = 0) => {
@@ -667,15 +805,39 @@ try {
 const place_panel = (x, y) => {
     if (!offset_panel_el) return;
 
+    // 面板设了 max-height，getBoundingClientRect 返回的就是实际渲染高度（不会超过屏幕）
     const r = offset_panel_el.getBoundingClientRect();
-    const nx = Math.max(0, Math.min(Math.max(0, window.innerWidth - r.width), x));
-    const ny = Math.max(0, Math.min(Math.max(0, window.innerHeight - r.height), y));
+    const max_x = Math.max(0, window.innerWidth - r.width);
+    const max_y = Math.max(0, window.innerHeight - r.height);
+
+    const nx = Math.max(0, Math.min(max_x, x));
+    const ny = Math.max(0, Math.min(max_y, y));
 
     offset_panel_el.style.right = "auto";
     offset_panel_el.style.bottom = "auto";
     offset_panel_el.style.left = nx + "px";
     offset_panel_el.style.top = ny + "px";
     offset_panel_pos = { x: nx, y: ny };
+};
+
+// 把面板拉回屏幕内（拖出边界、或者屏幕尺寸变化导致跑出去时用）
+const clamp_panel = () => {
+    if (!offset_panel_el) return;
+
+    const r = offset_panel_el.getBoundingClientRect();
+    const max_x = Math.max(0, window.innerWidth - r.width);
+    const max_y = Math.max(0, window.innerHeight - r.height);
+
+    // 用 left/top 作为当前位置；如果是用 right/bottom 定位（还没拖过）就跳过
+    const cur_x = offset_panel_el.style.left !== "" ? parseFloat(offset_panel_el.style.left) : r.left;
+    const cur_y = offset_panel_el.style.top !== "" ? parseFloat(offset_panel_el.style.top) : r.top;
+
+    const nx = Math.max(0, Math.min(max_x, Number.isFinite(cur_x) ? cur_x : 0));
+    const ny = Math.max(0, Math.min(max_y, Number.isFinite(cur_y) ? cur_y : 0));
+
+    if (Math.abs(nx - cur_x) > 0.5 || Math.abs(ny - cur_y) > 0.5) {
+        place_panel(nx, ny);
+    }
 };
 
 if (offset_toggle_btn && offset_panel_el) {
@@ -691,20 +853,24 @@ if (offset_toggle_btn && offset_panel_el) {
 if (offset_panel_el) {
     let drag = null;
 
-    offset_panel_el.addEventListener("pointerdown", e => {
+    // 拖动手柄 = 顶部「偏移 0 ms」标题条
+    // 只有从标题条按下才会拖动面板；面板其余区域留给手指滚动
+    const drag_handle = offset_panel_el.querySelector("#offset-value") || offset_panel_el;
+
+    drag_handle.addEventListener("pointerdown", e => {
         if (e.target.closest("button")) return;
 
         const r = offset_panel_el.getBoundingClientRect();
         drag = { dx: e.clientX - r.left, dy: e.clientY - r.top };
 
         try {
-            offset_panel_el.setPointerCapture(e.pointerId);
+            drag_handle.setPointerCapture(e.pointerId);
         } catch (err) {}
 
         e.preventDefault();
     });
 
-    offset_panel_el.addEventListener("pointermove", e => {
+    drag_handle.addEventListener("pointermove", e => {
         if (!drag) return;
         place_panel(e.clientX - drag.dx, e.clientY - drag.dy);
     });
@@ -716,10 +882,13 @@ if (offset_panel_el) {
         try {
             localStorage.setItem(OFFSET_POS_KEY, JSON.stringify(offset_panel_pos));
         } catch (e) {}
+
+        // 拖动后如果跑到屏幕上方（被 max-height 挤出去），拉回来
+        clamp_panel();
     };
 
-    offset_panel_el.addEventListener("pointerup", end_drag);
-    offset_panel_el.addEventListener("pointercancel", end_drag);
+    drag_handle.addEventListener("pointerup", end_drag);
+    drag_handle.addEventListener("pointercancel", end_drag);
 
     window.addEventListener("resize", () => {
         if (offset_panel_pos && !offset_panel_el.classList.contains("hidden")) {
@@ -730,7 +899,1114 @@ if (offset_panel_el) {
 
 set_offset(offset_ms);
 
+// ---- 字体切换（默认 + res 里的三个字体，按需加载，可随时切换）----
+const FONT_KEY = "phigros_font";
+const FONTS = [
+    { label: "默认", family: "sans-serif", file: null },
+    { label: "PHIFON", family: "PHIFON", file: "res/PHIFON.ttf" },
+    { label: "濑户", family: "SetoFont", file: "res/拾陆字濑户2.0-1.ttf" },
+    { label: "汉仪粗", family: "ResourceHanCN-Bold", file: "res/ResourceHanCN-Bold.ttf" }
+];
+
+let font_index = 0;
+let canvas_font_family = "sans-serif";   // 画布文字（噪域编号）用的字体族
+const font_promises = new Map();
+
+try {
+    font_index = Math.max(0, Math.min(FONTS.length - 1, Number(localStorage.getItem(FONT_KEY)) || 0));
+} catch (e) {}
+
+const font_value_el = document.querySelector("#font-value");
+const font_btns = Array.from(document.querySelectorAll("#offset-panel [data-font]"));
+
+const update_font_ui = busy => {
+    if (font_value_el) {
+        font_value_el.textContent = `字体：${FONTS[font_index].label}${busy ? "（载入中…）" : ""}`;
+    }
+
+    for (const btn of font_btns) {
+        btn.classList.toggle("font-active", Number(btn.dataset.font) === font_index);
+    }
+};
+
+// 按需加载：三个字体文件加起来 44MB，用到哪个才读哪个，同一个字体只读一次
+const load_font = (font, onProgress) => {
+    if (!font.file) return Promise.resolve();
+
+    if (!font_promises.has(font.family)) {
+        font_promises.set(font.family, (async () => {
+            const face = new FontFace(font.family, await load_bin(encodeURI(font.file), onProgress));
+            await face.load();
+            document.fonts.add(face);
+        })());
+    }
+
+    return font_promises.get(font.family);
+};
+
+const apply_font = async (idx, onProgress) => {
+    const i = Math.max(0, Math.min(FONTS.length - 1, Number(idx) || 0));
+    const font = FONTS[i];
+
+    font_index = i;
+    update_font_ui(true);
+
+    try {
+        await load_font(font, onProgress);
+    } catch (e) {
+        console.warn("字体加载失败，已回退默认字体：", font.file, e);
+    }
+
+    const family = font.file ? `"${font.family}", sans-serif` : "sans-serif";
+
+    canvas_font_family = family;
+    document.body.style.fontFamily = font.file ? family : "";
+
+    try {
+        localStorage.setItem(FONT_KEY, String(i));
+    } catch (e) {}
+
+    update_font_ui(false);
+};
+
+for (const btn of font_btns) {
+    btn.onclick = () => apply_font(Number(btn.dataset.font));
+}
+
+update_font_ui(false);
+
+// ---- 游玩 HUD（顶部进度条 / COMBO / AUTOPLAY / 分数 / 曲名 / 难度）----
+let hud_score = 0;         // 得分权重：PERFECT = 1，GOOD = 0.65，BAD / MISS = 0
+let hud_combo = 0;
+let hud_total_notes = 0;
+let last_judge = null;     // 最近一次判定，用于 HUD 短暂显示
+
+const hud_total = () => {
+    if (!hud_total_notes) {
+        hud_total_notes = C.chart.data.judgeLineList.reduce((sum, line) => sum + line.notes.length, 0) || 1;
+    }
+
+    return hud_total_notes;
+};
+
+// ---- 暂停（左上角按钮，随时可点）----
+let paused = false;
+let running = false;   // 是否正在游玩（返回主界面后置 false，渲染循环随之停止）
+
+// 暂停按钮的位置/尺寸：画和点都用这一个函数，保证一致
+const pause_button_rect = (w, h) => {
+    const bar_h = Math.max(5, h * 0.012);
+
+    return {
+        x: Math.max(8, w * 0.014),
+        y: bar_h * 1.5 + h * 0.012,           // 和 COMBO / 分数同一水平线
+        size: Math.max(22, h * 0.075)
+    };
+};
+
+const in_pause_button = (x, y, w, h) => {
+    const r = pause_button_rect(w, h);
+
+    return x >= r.x && x <= r.x + r.size && y >= r.y && y <= r.y + r.size;
+};
+
+const set_paused = on => {
+    paused = !!on;
+
+    if (!C.chart?.music) return;
+
+    if (paused) {
+        C.chart.music.pause();
+    } else {
+        if (actx.state === "suspended") {
+            actx.resume().catch(() => {});
+        }
+
+        C.chart.music.play().catch(e => console.warn("继续播放失败", e));
+    }
+};
+
+// 画暂停按钮：播放中显示两条竖线，暂停中显示播放三角
+const draw_pause_button = (ctx, w, h) => {
+    const r = pause_button_rect(w, h);
+    const rad = r.size / 2;
+    const cx = r.x + rad;
+    const cy = r.y + rad;
+
+    ctx.save();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, rad, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
+    ctx.fill();
+    ctx.lineWidth = Math.max(1.5, rad * 0.12);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.8)";
+    ctx.stroke();
+
+    ctx.fillStyle = "#fff";
+
+    if (paused) {
+        ctx.beginPath();
+        ctx.moveTo(cx - rad * 0.3, cy - rad * 0.48);
+        ctx.lineTo(cx + rad * 0.5, cy);
+        ctx.lineTo(cx - rad * 0.3, cy + rad * 0.48);
+        ctx.closePath();
+        ctx.fill();
+    } else {
+        const bw = Math.max(2, rad * 0.24);
+        ctx.fillRectEx(cx - rad * 0.44, cy - rad * 0.46, bw, rad * 0.92);
+        ctx.fillRectEx(cx + rad * 0.2, cy - rad * 0.46, bw, rad * 0.92);
+    }
+
+    ctx.restore();
+};
+
+// 暂停菜单按钮：继续 / 返回主界面（画和点共用同一份坐标）
+const pause_menu_buttons = (w, h) => {
+    const bw = Math.min(w * 0.4, h * 0.62);
+    const bh = Math.max(30, h * 0.1);
+    const gap = h * 0.03;
+    const x = (w - bw) / 2;
+    const y = h * 0.56;
+
+    return [
+        { label: "继续", action: "resume", x, y, w: bw, h: bh },
+        { label: "返回主界面", action: "home", x, y: y + bh + gap, w: bw, h: bh }
+    ];
+};
+
+const draw_pause_menu = (ctx, w, h, font) => {
+    for (const b of pause_menu_buttons(w, h)) {
+        ctx.beginPath();
+        ctx.rect(b.x, b.y, b.w, b.h);
+        ctx.fillStyle = "rgba(255, 255, 255, 0.14)";
+        ctx.fill();
+        ctx.lineWidth = Math.max(1.5, h * 0.004);
+        ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+        ctx.stroke();
+
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillStyle = "#fff";
+        ctx.font = font(h * 0.045, "bold");
+        ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2);
+    }
+};
+
+// ---- 开始游戏 / 返回主界面 ----
+// 复位判定状态：清掉所有音符的命中标记，combo / 分数 / 判定文字归零
+const reset_play_state = () => {
+    hud_score = 0;
+    hud_combo = 0;
+    last_judge = null;
+    note_log_seq = 0;   // 【调试】打击时间日志序号归零，重新游玩时从头打印
+
+    // 噪域状态一起清掉：不然被挡手指的柔光、点击提示会残留在画面上
+    noiseState.clear();
+    block_feedback.length = 0;
+
+    if (C.chart?.music) {
+        try {
+            C.chart.music.pause();
+            C.chart.music.currentTime = 0;
+        } catch (e) {}
+    }
+
+    for (const line of C.chart?.data?.judgeLineList ?? []) {
+        line.judge_tint = null;
+
+        for (const note of line.notes ?? []) {
+            note.clicked = false;
+            note.judge = undefined;
+            note.judge_time = undefined;
+            note.hold_failed = false;
+            note.hold_fail_time = undefined;
+            note.__logged = false;   // 【调试】允许重新打印打击时间
+        }
+    }
+};
+
+const start_play = () => {
+    document.querySelector("#start-screen").classList.add("hidden");
+
+    if (actx.state === "suspended") {
+        actx.resume().catch(e => console.warn("音频恢复失败", e));
+    }
+
+    paused = false;
+    running = true;
+    lastFrameTime = performance.now();
+
+    C.chart.music.play().catch(e => console.warn("音乐播放失败", e));
+    render();
+};
+
+// 返回主界面：停渲染循环 + 复位判定，回到开始界面（谱面资源留着，可以直接再开）
+const goto_menu = () => {
+    paused = false;
+    reset_play_state();
+
+    // 借一帧把暂停遮罩擦掉：render 末尾会再排一帧，但那时 running 已经是 false，会立刻退出
+    running = true;
+    render();
+    running = false;
+
+    document.querySelector("#start-screen").classList.remove("hidden");
+};
+// 开始游戏：期间导入 / 清理过谱面就先重新加载谱面资源，否则直接继续
+const start_or_reload = () => {
+    if (!chart_dirty) {
+        start_play();
+        return;
+    }
+
+    const loading = document.querySelector("#loading-screen");
+    const text = document.querySelector("#loading-text");
+
+    document.querySelector("#start-screen").classList.add("hidden");
+
+    if (text) {
+        text.style.color = "#aaa";
+        text.textContent = "正在加载资源...";
+    }
+
+    if (loading) loading.classList.remove("hidden");
+
+    loaded_steps = 0;
+    hud_total_notes = 0;
+    reset_play_state();
+
+    load_game().catch(e => {
+        console.error(e);
+
+        if (text) {
+            text.style.color = "#ff5566";
+            text.textContent = "加载失败：" + (e && e.message ? e.message : e);
+        }
+    });
+};
+
+const render_hud = (ctx, w, h) => {
+    const bar_h = Math.max(5, h * 0.012);     // 灰色进度条高度
+    const tick_h = bar_h * 1.5;               // 白色指示线：只比灰条长一丢丢
+    const pad = Math.max(8, w * 0.014);       // 左右留白
+    const font = (size, weight = "") => `${weight ? weight + " " : ""}${Math.round(size)}px ${canvas_font_family}`;
+
+    const combo_size = h * 0.065;             // COMBO 字号
+    const combo_y = tick_h + h * 0.012;       // COMBO：紧贴进度条下方
+    const autoplay_size = h * 0.028;          // AUTOPLAY 字号
+    const autoplay_y = combo_y + combo_size + h * 0.006;   // AUTOPLAY：紧贴 COMBO 下方
+
+    const dur = C.chart.music.duration || 0;
+    const progress = dur > 0 ? Math.max(0, Math.min(1, C.chart.music.currentTime / dur)) : 0;
+    const score = Math.min(1000000, Math.round(hud_score * 1000000 / hud_total()));
+
+    ctx.save();
+
+    // 暂停遮罩 + 菜单
+    if (paused) {
+        ctx.fillRectEx(0, 0, w, h, "rgba(0, 0, 0, 0.55)");
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.font = font(h * 0.09, "bold");
+        ctx.fillStyle = "#fff";
+        ctx.fillText("已暂停", w / 2, h * 0.42);
+        draw_pause_menu(ctx, w, h, font);
+    }
+    // 灰色进度条：只画到当前进度，跟着白色指示线一起走
+    ctx.fillRectEx(0, 0, w * progress, bar_h, "rgba(132, 132, 142, 0.55)");
+
+    // 白色竖直指示线：位置在进度末端，比灰条略长
+    const tick_w = Math.max(3, w * 0.0035);
+    ctx.fillRectEx(Math.max(0, Math.min(w - tick_w, w * progress - tick_w / 2)), 0, tick_w, tick_h, "rgba(255, 255, 255, 0.92)");
+
+    // 右上角：分数（满分 1000000，每个 note 分数一致，补足 7 位）
+    ctx.textBaseline = "top";
+    ctx.textAlign = "right";
+    ctx.font = font(combo_size * 0.8);
+    ctx.fillStyle = "#fff";
+    ctx.fillText(String(score).padStart(7, "0"), w - pad, combo_y);
+
+    // 进度条正下方：COMBO
+    if (hud_combo > 0) {
+        ctx.textAlign = "center";
+        ctx.font = font(combo_size, "bold");
+        ctx.fillStyle = "#fff";
+        ctx.fillText(String(hud_combo), w / 2, combo_y);
+    }
+
+    // COMBO 正下方：自动游玩时显示 AUTOPLAY，关掉后显示 COMBO
+    ctx.textAlign = "center";
+    ctx.font = font(autoplay_size);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.fillText(autoplay ? "AUTOPLAY" : "COMBO", w / 2, autoplay_y);
+
+    // 判定文字（0.6s 淡出）
+    if (last_judge) {
+        const age = (performance.now() - last_judge.time) / 1000;
+
+        if (age < 0.6) {
+            ctx.globalAlpha = 1 - age / 0.6;
+            ctx.font = font(h * 0.034, "bold");
+            ctx.fillStyle = JUDGE_COLORS[last_judge.type] || "#fff";
+            ctx.fillText(last_judge.type, w / 2, autoplay_y + autoplay_size + h * 0.008);
+            ctx.globalAlpha = 1;
+        }
+    }
+
+    // 左下角曲名 / 右下角难度（来自 res/chart/info.json）
+    ctx.textBaseline = "bottom";
+    ctx.font = font(h * 0.04);
+    ctx.fillStyle = "rgba(255, 255, 255, 0.92)";
+    ctx.textAlign = "left";
+    ctx.fillText(C.chart.info?.name ?? "", pad, h - pad);
+    ctx.textAlign = "right";
+    ctx.fillText(C.chart.info?.level ?? "", w - pad, h - pad);
+
+    // 左上角暂停按钮（画在最上层）
+    draw_pause_button(ctx, w, h);
+
+    ctx.restore();
+};
+
+// ---- 自动游玩开关 + 手动判定 ----
+// 判定窗口（秒）：|Δ|≤0.08 → PERFECT；0.08<|Δ|≤0.11 → GOOD；Δ<-0.11（过早）→ BAD；漏掉 → MISS
+const JUDGE_PERFECT = 0.080;
+const JUDGE_GOOD = 0.110;
+const HIT_RADIUS_FACTOR = 1.5;      // 判定带宽度 = 音符宽度 × 该系数（沿线方向）
+const JUDGE_COLORS = {
+    PERFECT: "#ffe066",
+    GOOD: "#6ec6ff",
+    BAD: "#b8b8c0",
+    MISS: "#ff5566"
+};
+
+const AUTOPLAY_KEY = "phigros_autoplay";
+let autoplay = true;
+
+try {
+    const saved_autoplay = localStorage.getItem(AUTOPLAY_KEY);
+    if (saved_autoplay !== null) autoplay = saved_autoplay === "1";
+} catch (e) {}
+
+const autoplay_btn = document.querySelector("#autoplay-toggle");
+
+const set_autoplay = on => {
+    autoplay = !!on;
+
+    // 自动播放面板
+    if (autoplay_btn) {
+        autoplay_btn.textContent = `自动游玩（实验）：${autoplay ? "开" : "关"}`;
+    }
+
+    try {
+        localStorage.setItem(AUTOPLAY_KEY, autoplay ? "1" : "0");
+    } catch (e) {}
+};
+
+if (autoplay_btn) {
+    autoplay_btn.onclick = () => set_autoplay(!autoplay);
+}
+
+set_autoplay(autoplay);
+
+// BAD 最多能提前多少（Tap 专属）：再早的点击直接忽略，不会去吃掉那个音符
+const JUDGE_BAD_EARLY = 0.25;
+
+// 各音符类型的判定窗口（秒）
+//   Tap  ：PERFECT ±0.08 / GOOD ±0.11 / 过早 → BAD
+//   Hold ：PERFECT ±0.08 / GOOD ±0.11（没有 BAD）
+//   Drag、Flick：只有 PERFECT ±0.08（没有 GOOD / BAD）
+const judge_windows = note => {
+    const is_tap = note.type === C.note.tap;
+    const is_hold = note.type === C.note.hold;
+
+    return {
+        perfect: JUDGE_PERFECT,
+        good: (is_tap || is_hold) ? JUDGE_GOOD : JUDGE_PERFECT,   // 能被点中的最宽窗口
+        bad: is_tap,                                              // 只有 Tap 有 BAD
+        earliest: is_tap ? JUDGE_BAD_EARLY : (is_hold ? JUDGE_GOOD : JUDGE_PERFECT)   // 最多能提前多久点
+    };
+};
+
+// ============================================================
+// 【调试】打击时间日志
+//   每个方块只在「第一次被判定」时打印一次（PERFECT / GOOD / BAD / MISS 都算）
+//   想关掉：把下面 NOTE_TIME_LOG 改成 false
+// ============================================================
+const NOTE_TIME_LOG = true;
+
+const NOTE_TYPE_NAME = {
+    [1]: "Tap",
+    [2]: "Drag",
+    [3]: "Hold",
+    [4]: "Flick"
+};
+
+// 打印顺序号 = 谱面时间顺序，方便和谱面对照
+let note_log_seq = 0;
+
+// 记录一个音符的判定结果。重复调用（同一音符）只打印一次，不会刷屏
+const log_note_time = (note, judge, hit_time) => {
+    if (!NOTE_TIME_LOG) return;
+    if (note.__logged) return;          // 每个方块只打一次
+
+    note.__logged = true;
+    note_log_seq++;
+
+    const type_name = NOTE_TYPE_NAME[note.type] ?? ("未知类型" + note.type);
+    const hit = (hit_time === undefined || hit_time === null || !Number.isFinite(hit_time))
+        ? note.sect
+        : hit_time;
+    const delta = hit - note.sect;       // 正 = 点晚了，负 = 点早了
+
+    const s3 = v => (Number.isFinite(v) ? v.toFixed(3) : String(v));
+
+    console.log(
+        `#${note_log_seq} [${type_name}] `
+        + `谱面时间 ${s3(note.sect)}s | `
+        + `实际打击 ${s3(hit)}s | `
+        + `偏差 ${delta >= 0 ? "+" : ""}${s3(delta)}s | `
+        + `${judge}`
+        + (note.is_hold ? ` | Hold 结束 ${s3(note.hold_end_time)}s（时长 ${s3(note.secht)}s）` : "")
+        + (note.morebets ? " | 多押" : "")
+    );
+};
+
+// 结算：把整张谱的音符按时间顺序一次性全部列出（不打印，返回数组供预览 / 导出）
+// 用法：console.log(note_time_table())
+const note_time_table = () => {
+    // 直接返回音符对象本身（不复制），这样能看到 judge / judge_time 的实时状态
+    const notes = [];
+
+    for (const line of C.chart?.data?.judgeLineList ?? []) {
+        for (const note of line.notes ?? []) {
+            notes.push(note);
+        }
+    }
+
+    notes.sort((a, b) => a.sect - b.sect);
+
+    return notes.map(note => ({
+        type: NOTE_TYPE_NAME[note.type] ?? note.type,
+        time: Number(note.sect.toFixed(3)),
+        hold_end: note.is_hold ? Number(note.hold_end_time.toFixed(3)) : null,
+        judge: note.judge ?? "(未判定)",
+        hit: note.judge_time !== undefined ? Number(note.judge_time.toFixed(3)) : null,
+        delta: note.judge_time !== undefined ? Number((note.judge_time - note.sect).toFixed(3)) : null
+    }));
+};
+
+// ============================================================
+// 【调试】导出谱面打击记录（Phira 谱面文本格式）
+//
+// 格式：
+//   n1/n3/n4 0 时间 X位置 1 0 # 1.0 & 1.0    ← Tap / Flick / Drag
+//   n2       0 开始时间 结束时间 X位置 1 0 # 1.0 & 1.0  ← Hold
+//
+// 时间单位：note.sect / note.secht 是「秒」（读谱时按 拍 × (60/32) / bpm 算好）
+// PEC / Phira 要的是「拍」→ 必须乘 bpm × 32 / 60，不能直接写 sect
+//   1 拍 = (60/32) / bpm 秒  ⇒  beat = sect ÷ (60/32 / bpm) = sect × bpm × 32 / 60
+//   例：bpm 150 → ×80 ；bpm 220.5 → ×117.6
+// 想改输出内容，只改 export_note_text 里的模板即可
+// ============================================================
+
+// 音符类型 → PEC 指令标识符
+// 【注意】Phigros json 的类型编号不是 PEC 的编号，两套完全不同：
+//   json: 1=Tap  2=Drag  3=Hold  4=Flick
+//   PEC : n1=Tap  n2=Hold  n3=Flick  n4=Drag
+//   → Hold 在 PEC 是 n2，Flick 是 n3，Drag 才是 n4（最容易搞反的就是这两个）
+const PHIRA_NOTE_TAG = {
+    [1]: "n1",   // Tap
+    [2]: "n4",   // Drag  ← 黄键，PEC 里是 n4
+    [3]: "n2",   // Hold
+    [4]: "n3"    // Flick ← 红键，PEC 里是 n3
+};
+
+// 判断一条判定线是不是「背面」（notesBelow）
+// PEC 规范：s = 1 表示 above，s = 2 表示 below
+const pec_side_flag = note => (note.is_above === false ? 2 : 1);
+
+// PEC 坐标空间：左上(0,0) → 右下(2048,1400)
+const PEC_W = 2048, PEC_H = 1400;
+
+// Phigros json 的 positionX → PEC 像素
+//   你的渲染换算：note_u = positionX × pgrw × w，pgrw = 0.05625
+//   → positionX = 1 对应线宽的 5.625%
+//   本谱 positionX ∈ [-7, 7]，换算后 x ∈ [-806, 806]，刚好落在屏幕半宽 1024 内
+// 音符 x 的 PEC 像素换算：
+//   Phira 解析 PEC 时 position_x = pec_x / 1024
+//   Phira 解析 Phigros JSON 时 translation = positionX * (2 * 9/160) = positionX * 0.1125
+//   两者要等价 ⇒ pec_x = positionX * 0.1125 * 1024 = positionX * 115.2
+// （115.2 = 0.05625 * 2048，与渲染时 positionX * pgrw * w 的比例一致）
+const PEC_X_SCALE = 0.1125 * 1024;   // = 115.2
+
+// Phigros JSON 的 time ↔ PEC 拍 的关系（依据 pec2json.js 的 BpmList.calc）：
+//   pgr_time = pec_beat × baseBpm × 32   ⇒   pec_beat = pgr_time / 32
+// bpm 在这里两边抵消，所以换算跟 bpm 无关。
+//   g1: 1 个 pgr time 单位 = 60 / (32 × bpm) 秒
+//   g2: 1 个 PEC 拍        = 60 / bpm 秒
+//   ⇒ 1 个 pgr time 单位 = 1/32 个 PEC 拍   ✅
+const PGR_TIME_PER_PEC_BEAT = 32;
+
+// pgr time（拍 × 32）→ PEC 拍
+const pgr_time_to_pec_beat = t => Number(t) / PGR_TIME_PER_PEC_BEAT;
+
+// PEC 拍 → pgr time（反方向，导入 .pec 时用得到）
+const pec_beat_to_pgr_time = b => Number(b) * PGR_TIME_PER_PEC_BEAT;
+
+// PEC 里 cv 与 Phigros speedEvent.value 的倍率：Phira 里是 value / 5.85
+// 线速 cv 的换算（两边 floorPosition 的定义必须对齐）：
+//   Phira 解析 Phigros JSON (pgr.rs):
+//       pos += (end_time - start_time) * r * value;   r = 60/32/bpm
+//       kf.value /= HEIGHT_RATIO;                     HEIGHT_RATIO = 0.83175
+//   Phira 解析 PEC (pec.rs, parse_speed_events):
+//       height += (time - last_time) * last_speed;    time 是秒
+//       cv 读入时是 value / 5.85
+//   两者等价（Δt(秒) = Δt(pgr) × 60/32/bpm）⇒
+//       cv / 5.85 = value / 0.83175
+//       cv = value × 5.85 / 0.83175 = value × 7.0334
+//   ⚠️ 直接用 5.85 会让整谱流速只有正确的 83.2%
+const PEC_HEIGHT_RATIO = 0.83175;                   // prpr/src/core.rs: HEIGHT_RATIO
+const PEC_SPEED_SCALE = 5.85 / PEC_HEIGHT_RATIO;    // ≈ 7.0334
+
+// Phira 的固定延迟：offset = pec首行/1000 - 0.15 ⇒ 导出时首行 = (offset + 0.15) × 1000
+const PEC_FIXED_OFFSET = 0.15;   // Phira: offset = 首行/1000 - 0.15
+
+// 数字格式化：PEC 不要求固定小数位，但太长的浮点会让文件难读
+const pec_num = (v, digits = 3) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return "0";
+    const s = n.toFixed(digits).replace(/\.?0+$/, "");
+    return s === "" || s === "-0" ? "0" : s;
+};
+
+// 注意：PEC 的 cd/cr 用的是「角度」，不是弧度，所以这里不需要任何角度→弧度转换。
+// （曾经有过一个 rad_or_deg_to_rad，已删除，避免再被误用）
+
+// ============================================================
+// PEC 导出（按 Phira 的 prpr/src/parse/pec.rs 实现，不是 pec2json 的方言）
+//
+// 指令参数（严格对齐 Rust 解析器的 take_* 顺序）：
+//   cp  line  time  x  y                     → 单点
+//   cm  line  t1  t2  x  y  tween            → 渐变到 (x,y)，只给终点
+//   cd  line  time  rot                     → 单点
+//   cr  line  t1  t2  rot  tween            → 渐变到 rot
+//   ca  line  time  alpha
+//   cf  line  t1  t2  alpha  tween
+//   cv  line  time  speed
+//
+// 【单位】
+//   位置：PEC 存像素，解析端做 x/2048*2-1、y/1400*2-1 映射到 [-1,1]
+//         Phigros JSON 的 move 是 [0,1] ⇒ px = json * 2048 / 1400（不翻转）
+//   音符 x：解析端做 /1024 ⇒ PEC 的 x 是 positionX * 1024
+//           （与判定线 px 不同！判定线是 2048，音符是 1024）
+//   时间：PEC 是拍；Phigros JSON 的 time 是「1/32 拍」⇒ beat = time / 32
+//   旋转：解析端做 -value，所以导出时已经取负
+//   透明度：解析端 value / 255
+//   线速：解析端 value / 5.85
+//   offset：解析端 首行/1000 - 0.15 ⇒ 导出时首行 = (offset + 0.15) * 1000
+// ============================================================
+//
+// 单位换算依据 lib/pec2json.js：
+//   cm/cp  offsetX / 2048 → x 比例，offsetY / 1400 → y 比例
+//   cd/cr  rotation 取负，角度 → 角度（不是弧度！）
+//   ca/cf  alpha / 255
+//   cv     speed / 7
+//   n*     时间 = time / 32
+//
+// 官方谱的事件都是逐帧（整数 startTime、时长多为 1），正好对得上 PEC 的
+// “每个时间点一条指令”格式，所以直接逐事件展开，不需要再做缓动采样。
+const pec_line_commands = line => {
+    const out = [];
+    const idx = line.__pec_index ?? 0;
+
+    // 官方谱里有 startTime = -999999 的“开场前占位事件”，它表示 t=0 之前线的初始状态。
+    // 直接丢掉会丢失初值（format 只能拿下一个事件的起点兜底），
+    // 换算成拍又会出现 -31250 这种负数让解析器错位。
+    // 正确做法：保留它，只把开始时间夹到 0，终点保持原值，变成合法的 [0, endTime] 段。
+    const valid = e => Number(e.endTime ?? e.startTime) > 0;
+
+    const clip = e => {
+        const st = Math.max(0, Number(e.startTime));
+        const en = Math.max(st, Number(e.endTime ?? e.startTime));
+        return { ...e, startTime: st, endTime: en };
+    };
+
+    // 时间：pgr time → PEC 拍
+    const t = v => pec_num(pgr_time_to_pec_beat(v), 3);
+
+    // 位移：PEC 像素 = json比例 × 2048 / 1400（Phira 解析时 /2048*2-1，还原成 [-1,1]）
+    const px_x = v => Number((Number(v) * PEC_W).toFixed(2));
+    const px_y = v => Number((Number(v) * PEC_H).toFixed(2));
+
+    // ---- 位移 ----
+    // Phira 的 cm 只接收【终点】，起点 = 上一帧的状态。
+    // 所以当某段的起点和上一段的终点不一致（跳变）时，必须先补一个 cp 把线瞬移过去，
+    // 否则那一段会从错误的位置开始渐变。
+    const move_evs = (line.judgeLineMoveEvents ?? []).filter(valid).map(clip);
+    let last_x = null, last_y = null;
+
+    for (const e of move_evs) {
+        const x1 = px_x(e.start), y1 = px_y(e.start2 ?? 0.5);
+        const x2 = px_x(e.end ?? e.start), y2 = px_y(e.end2 ?? e.start2 ?? 0.5);
+
+        // 起点和上一段终点不一致 → 跳变，先瞬移
+        if (last_x === null || x1 !== last_x || y1 !== last_y) {
+            out.push(`cp ${idx} ${t(e.startTime)} ${x1} ${y1}`);
+            last_x = x1; last_y = y1;
+        }
+
+        if (x1 === x2 && y1 === y2) {
+            // 静止段：如果上一段已经把它放到位了就不用重复写
+            if (last_x !== x2 || last_y !== y2) {
+                out.push(`cp ${idx} ${t(e.startTime)} ${x2} ${y2}`);
+                last_x = x2; last_y = y2;
+            }
+        } else {
+            // cm idx t1 t2 x y tween  —— 只有终点，tween 1 = 线性
+            out.push(`cm ${idx} ${t(e.startTime)} ${t(e.endTime)} ${x2} ${y2} 1`);
+            last_x = x2; last_y = y2;
+        }
+    }
+
+    // ---- 旋转（取负；只给终点）----
+    // 同样：cr 的起点是上一帧的值，跳变时要先补 cd 瞬移
+    const rot_evs = (line.judgeLineRotateEvents ?? []).filter(valid).map(clip);
+    let last_r = null;
+
+    for (const e of rot_evs) {
+        const r1 = pec_num(-Number(e.start ?? 0), 3);
+        const r2 = pec_num(-Number(e.end ?? e.start ?? 0), 3);
+
+        if (last_r === null || r1 !== last_r) {
+            out.push(`cd ${idx} ${t(e.startTime)} ${r1}`);
+            last_r = r1;
+        }
+
+        if (r1 === r2) {
+            if (last_r !== r2) {
+                out.push(`cd ${idx} ${t(e.startTime)} ${r2}`);
+                last_r = r2;
+            }
+        } else {
+            // cr idx t1 t2 rot tween
+            out.push(`cr ${idx} ${t(e.startTime)} ${t(e.endTime)} ${r2} 1`);
+            last_r = r2;
+        }
+    }
+
+    // ---- 透明度 0~1 → 0~255（只给终点）----
+    const alpha_evs = (line.judgeLineDisappearEvents ?? []).filter(valid).map(clip);
+    let last_a = null;
+
+    for (const e of alpha_evs) {
+        const a1 = Math.round(Math.max(0, Math.min(1, Number(e.start ?? 0))) * 255);
+        const a2 = Math.round(Math.max(0, Math.min(1, Number(e.end ?? e.start ?? 0))) * 255);
+
+        if (last_a === null || a1 !== last_a) {
+            out.push(`ca ${idx} ${t(e.startTime)} ${a1}`);
+            last_a = a1;
+        }
+
+        if (a1 === a2) {
+            if (last_a !== a2) {
+                out.push(`ca ${idx} ${t(e.startTime)} ${a2}`);
+                last_a = a2;
+            }
+        } else {
+            // cf idx t1 t2 alpha  —— 注意：cf 没有 tween 参数！
+            out.push(`cf ${idx} ${t(e.startTime)} ${t(e.endTime)} ${a2}`);
+            last_a = a2;
+        }
+    }
+
+    // ---- 线速：Phigros value → PEC cv（×5.85）----
+    for (const e of (line.speedEvents ?? []).filter(valid).map(clip)) {
+        out.push(`cv ${idx} ${t(e.startTime)} ${pec_num(Number(e.value ?? 0) * PEC_SPEED_SCALE, 4)}`);
+    }
+
+    return out;
+};
+
+// 生成整张谱的 PEC 文本
+//   only_judged: 只导出已被判定的音符（打谱记录）
+//   with_lines:  是否附带线条指令（cp/cd/ca/cm/cr/cf/cv）
+const export_note_text = (only_judged = false, with_lines = false) => {
+    const lines = [];
+
+    // ---- 文件头：第一行是 offset（毫秒） ----
+    // Phira/Phigros 解析时是 offset = 首行/1000 - 0.175，所以要反向加回去
+    const offset_sec_chart = Number(C.chart?.data?.offset ?? 0);
+    lines.push(String(Math.round((offset_sec_chart + PEC_FIXED_OFFSET) * 1000)));
+
+    // ---- bp 指令：PEC 的 bp 是全局的（按拍）----
+    const base_bpm = Number(C.chart?.data?.judgeLineList?.[0]?.bpm) || 120;
+    const all_bpms = [...new Set((C.chart?.data?.judgeLineList ?? [])
+        .map(line => Number(line.bpm) || 120))];
+
+    if (all_bpms.length > 1) {
+        // PEC 只有一条全局 bpm 轨；多 bpm 谱面导出会有拍数偏差
+        console.warn("[PEC 导出] 谱面存在多个 bpm，PEC 仅支持全局 bpm，已按第一条线导出");
+    }
+
+    lines.push(`bp 0 ${pec_num(base_bpm, 4)}`);
+
+    // ---- 线条指令（可选）----
+    if (with_lines) {
+        const idx_map = new Map();
+        C.chart.data.judgeLineList.forEach((line, i) => {
+            line.__pec_index = i;
+            idx_map.set(line, i);
+        });
+
+        for (const line of C.chart.data.judgeLineList) {
+            lines.push(...pec_line_commands(line));
+        }
+    }
+
+    // ---- 音符 ----
+    const rows = [];
+
+    C.chart.data.judgeLineList.forEach((line, line_idx) => {
+        // notesBelow 在 init 里已经被 merge_notes 合进 line.notes 了，但导出时
+        // 万一还是在 notesAbove / notesBelow 结构上（未进游戏就导出），两边都扫一遍
+        const note_list = line.notes
+            ? line.notes
+            : [...(line.notesAbove ?? []), ...(line.notesBelow ?? [])];
+
+        for (const note of note_list) {
+            if (only_judged && !note.clicked) continue;
+
+            const tag = PHIRA_NOTE_TAG[note.type] ?? "n1";
+
+            // PEC 音符 x：Phira 解析时是 /1024，所以这里乘 1024（不是判定线的 2048）
+            const x = pec_num(Number(note.positionX) * PEC_X_SCALE, 2);
+            const s = pec_side_flag(note);      // 1=above  2=below
+            const z = 0;                        // 0=正常  1=假音符（你的谱面没有假音符）
+            // 【关键】Phira 解析 Phigros JSON 时（pgr.rs）：
+            //   speed: if pgr.kind == 3 { 1. } else { pgr.speed as f64 }
+            // 也就是 Hold（type 3）的速度被强制为 1，忽略 json 里的 speed。
+            // 而 PEC 的 # 是无条件覆盖 note.speed，所以 Hold 的 # 必须写 1，
+            // 否则会变成 json 里那个 500 之类的大值，Hold 被拉成几百倍长。
+            const speed = note.is_hold ? "1" : pec_num(Number(note.speed ?? 1), 3);
+
+            // PEC 的时间单位是「拍」：note.time 是「pgr time」，÷32 就是 PEC 拍
+            // （bpm 在两边抵消，不需要也不应该再乘 bpm/60）
+            const t1 = pec_num(pgr_time_to_pec_beat(note.time), 3);
+
+            let body;
+
+            if (note.is_hold) {
+                // n2 = Hold：开始拍 结束拍 x s z
+                const t2 = pec_num(pgr_time_to_pec_beat(Number(note.time) + Number(note.holdTime ?? 0)), 3);
+                body = `${tag} ${line_idx} ${t1} ${t2} ${x} ${s} ${z}`;
+            } else {
+                body = `${tag} ${line_idx} ${t1} ${x} ${s} ${z}`;
+            }
+
+            // 速度 / 大小：规范里是独立的两行
+            body += `\n# ${speed}\n& 1`;
+
+            rows.push({ note, t: Number(note.sect), body });
+        }
+    });
+
+    rows.sort((a, b) => a.t - b.t);
+    lines.push(...rows.map(r => r.body));
+
+    return lines.join("\n");
+};
+
+// 导出并触发下载（手机上会走浏览器下载 / 保存）
+const download_note_text = (only_judged = false) => {
+    const text = export_note_text(only_judged);
+    const name = (C.chart?.info?.name || "chart")
+        .replace(/[\\/:*?"<>|]/g, "_")
+        + (only_judged ? "_judged" : "_all") + ".txt";
+
+    const blob = new Blob(["\ufeff" + text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+
+    // 延迟释放，避免个别 WebView 下载还没开始就被回收
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+    console.log(`已导出 ${name}（${text.split("\n").length} 行）`);
+    return text;
+};
+
+// 打印前 N 行到控制台预览（不下载）
+const preview_note_text = (n = 10) => {
+    const lines = export_note_text(true).split("\n");
+    console.log(lines.slice(0, n).join("\n"));
+    console.log(`... 共 ${lines.length} 行（用 download_note_text() 导出全部）`);
+};
+
+// ---- 导出按钮：放在导出函数之后绑定，顺序不依赖「延迟调用」的巧合 ----
+const export_status_el = document.querySelector("#export-status");
+
+const set_export_status = (text, is_error = false) => {
+    if (!export_status_el) return;
+
+    export_status_el.textContent = text;
+    export_status_el.style.color = is_error ? "#ff7b7b" : "#8fe3a0";
+
+    // 3 秒后自动清空，避免一直挂着旧提示
+    clearTimeout(set_export_status.__timer);
+    set_export_status.__timer = setTimeout(() => {
+        export_status_el.textContent = "";
+    }, 3000);
+};
+
+const bind_export_btn = (id, only_judged) => {
+    const btn = document.querySelector("#" + id);
+
+    if (!btn) return;
+
+    btn.onclick = () => {
+        try {
+            if (!C.chart?.data?.judgeLineList) {
+                set_export_status("谱面还没加载好", true);
+                return;
+            }
+
+            const text = download_note_text(only_judged);
+            const count = text ? text.split("\n").length : 0;
+
+            set_export_status(`已导出 ${count} 个音符`);
+        } catch (e) {
+            console.error("[导出] 失败", e);
+            set_export_status("导出失败：" + (e && e.message ? e.message : e), true);
+        }
+    };
+};
+
+bind_export_btn("export-judged", true);    // 只导已判定的
+bind_export_btn("export-all", false);      // 导全谱面
+
+// 判定一个音符：delta = 点击时的谱面时间 - 音符时间（正 = 点晚了，负 = 点早了）
+// 返回判定结果；如果这个音符在当前时刻不允许被判定（例如 Drag 早点了），返回 null 且不消耗它
+const judge_note = (note, delta) => {
+    const abs = Math.abs(delta);
+    const win = judge_windows(note);
+    let type = null;
+
+    if (abs <= win.perfect) {
+        type = "PERFECT";
+    } else if (abs <= win.good) {
+        type = "GOOD";
+    } else if (win.bad && delta < 0) {
+        type = "BAD";      // 太早：只有 Tap 会吃 BAD
+    }
+
+    if (!type) return null;
+
+    note.clicked = true;
+    note.judge = type;
+
+    if (type === "PERFECT") {
+        hud_score += 1;
+        hud_combo++;
+    } else if (type === "GOOD") {
+        hud_score += 0.65;
+        hud_combo++;
+    } else {
+        hud_combo = 0;
+    }
+
+    note.judge_time = note.sect + delta;
+
+    // 【调试】打击时间日志
+    log_note_time(note, type, note.judge_time);
+
+    // 判定线颜色：GOOD → 蓝；断连（BAD / MISS）→ 白
+    // PERFECT 不动 tint（否则紧接着的 PERFECT 会把蓝色立刻抹掉，看起来一闪一闪）
+    if (note.master && (type === "GOOD" || type === "BAD" || type === "MISS")) {
+        note.master.judge_tint = {
+            color: type === "GOOD" ? GOOD_COLOR : MISS_COLOR,
+            time: performance.now()
+        };
+    }
+
+    last_judge = { type, time: performance.now() };
+
+    if (type === "PERFECT" || type === "GOOD") {
+        play_sound(C.click_sounds[note.type]);
+    }
+
+    return type;
+};
+
+// 在判定带里找可判定的音符
+//   判定带 = 垂直于音符的竖条：u（沿线方向）必须对准音符，v（下落方向）基本不限
+//   kinds 指定允许的类型；by_time = true 时按 |Δ 时间| 最近优先（否则按横向距离）
+const find_note_in_band = (kinds, x, y, t, w, h) => {
+    const half_w = w * 0.1234375 * HIT_RADIUS_FACTOR / 2;   // 判定带半宽（沿线方向）
+    const judge_len = h * 0.5;                              // 判定带沿下落方向的延伸（基本覆盖半屏）
+    let best = null;
+    let best_abs = Infinity;
+    let best_dist = Infinity;
+
+    for (const line of C.chart.data.judgeLineList) {
+        const line_state = line.get_state(t);
+        const line_rotate = line_state[0];
+        const line_x = line_state[1] * w;
+        const line_y = line_state[2] * h;
+
+        const cr = Math.cos(line_rotate * Math.PI / 180);
+        const sr = Math.sin(line_rotate * Math.PI / 180);
+        const dx = x - line_x;
+        const dy = y - line_y;
+        const u = dx * cr + dy * sr;        // 沿线方向（音符宽度方向）
+        const v = -dx * sr + dy * cr;       // 与音符垂直（下落方向）
+
+        if (Math.abs(v) > judge_len) continue;
+
+        for (const note of line.notes) {
+            if (note.clicked) continue;
+            if (kinds.indexOf(note.type) === -1) continue;
+
+            const delta = t - note.sect;
+            const wide = (note.type === C.note.tap || note.type === C.note.hold) ? JUDGE_GOOD : JUDGE_PERFECT;
+            const earliest = note.type === C.note.tap ? JUDGE_BAD_EARLY : wide;
+
+            // 只考虑这个类型“允许被点中”的时间范围
+            if (delta > wide || delta < -earliest) continue;
+
+            const note_u = note.positionX * C.units.pgrw * w;   // 音符落点在线上（沿线方向）的位置
+            const dist = Math.abs(u - note_u);
+
+            if (dist > half_w) continue;
+
+            const abs = Math.abs(delta);
+
+            // 时间优先：先挑 |Δ| 最小的（这才是你此刻想打的那个音），时间相同再比横向距离
+            if (abs < best_abs - 1e-6 || (Math.abs(abs - best_abs) <= 1e-6 && dist < best_dist)) {
+                best = note;
+                best_abs = abs;
+                best_dist = dist;
+            }
+        }
+    }
+
+    return best;
+};
+
+// 点按判定：只判 Tap / Hold（Drag 靠“按住”，Flick 靠“滑动”，都不走这里）
+const judge_tap = (x, y, t, w, h) => {
+    const note = find_note_in_band([C.note.tap, C.note.hold], x, y, t, w, h);
+
+    if (note) {
+        judge_note(note, t - note.sect);
+    }
+};
+
+// 滑动判定：只判 Flick，需要在两个位置里找（手指起点和当前位置）
+const judge_flick = (origin, current, t, w, h) => {
+    const note = find_note_in_band([C.note.flick], origin[0], origin[1], t, w, h)
+        ?? find_note_in_band([C.note.flick], current[0], current[1], t, w, h);
+
+    if (note) {
+        judge_note(note, t - note.sect);
+    }
+};
+
+// Drag 的“按住”判定内联在 render 的音符循环里（那里已经有 lineX / lineY / lineRotate，不必重算）
+
+// ---- 判定视觉：GOOD 蓝 / 断连白 / BAD 红方块 / MISS 渐隐 ----
+const GOOD_COLOR = [0x6e, 0xc6, 0xff];     // GOOD：判定线 + 打击特效的蓝色
+const MISS_COLOR = [0xff, 0xff, 0xff];     // 断连（BAD / MISS）：判定线变白
+const BAD_COLOR = [0xff, 0x5a, 0x5a];      // BAD：方块变红
+const LINE_TINT_TIME = 0.4;                // 判定线变色持续（秒）
+const DEAD_KEEP_TIME = 0.6;                // BAD / MISS 后音符还画多久（秒）
+const MISS_FADE_TIME = 0.5;                // MISS 方块渐隐时长（秒）
+const HOLD_FAIL_ALPHA = 0.5;               // Hold 没长按 / 漏按时的透明度
+
+let hit_fx_imgs_blue = null;               // GOOD 用的蓝色特效帧（第一次用到才生成）
+let note_head_imgs_red = null;             // BAD 用的红色方块（第一次用到才生成）
+
+// 把图片染成指定颜色，返回新 canvas（不改原图）
+const tint_img = (img, color) => {
+    const tempcv = document.createElement("canvas");
+    tempcv.width = img.width;
+    tempcv.height = img.height;
+    tempcv.getContext("2d").drawImage(img, 0, 0);
+    return cv_put_color(tempcv, color);
+};
+
+// 生成一整套打击特效帧（C.pcolor = 默认黄，GOOD_COLOR = 蓝）
+const build_hit_fx_imgs = color => {
+    const imgs = [];
+
+    for (let j = 0; j < C.respack_info.hitFx[1]; j++) {
+        for (let i = 0; i < C.respack_info.hitFx[0]; i++) {
+            imgs.push(
+                cv_put_color(clip_block_img(
+                    C.hit_fx,
+                    (i / C.respack_info.hitFx[0]) * C.hit_fx.width,
+                    (j / C.respack_info.hitFx[1]) * C.hit_fx.height,
+                    ((i + 1) / C.respack_info.hitFx[0]) * C.hit_fx.width,
+                    ((j + 1) / C.respack_info.hitFx[1]) * C.hit_fx.height
+                ), color)
+            );
+        }
+    }
+
+    return imgs;
+};
+
+// 打击特效帧：PERFECT 用默认黄，GOOD 用蓝，BAD / MISS 不画
+const fx_imgs_for = note => {
+    if (note.judge !== "GOOD") return C.hit_fx_imgs;
+
+    if (!hit_fx_imgs_blue) {
+        hit_fx_imgs_blue = build_hit_fx_imgs(GOOD_COLOR);
+    }
+
+    return hit_fx_imgs_blue;
+};
+
+// 判定线 / 粒子颜色
+const judge_color = judge => (judge === "GOOD" ? GOOD_COLOR : C.pcolor);
+
+const line_tint_color = line => {
+    const tint = line.judge_tint;
+
+    if (tint && tint.color && (performance.now() - tint.time) / 1000 < LINE_TINT_TIME) {
+        return tint.color;
+    }
+
+    return C.pcolor;
+};
+
+// BAD 用的红色方块（第一次用到才生成，避免启动时多做 9 张图）
+const red_note_head_img = note => {
+    if (!note_head_imgs_red) {
+        note_head_imgs_red = {};
+
+        for (const type of Object.keys(C.note_head_imgs)) {
+            note_head_imgs_red[type] = C.note_head_imgs[type].map(img => tint_img(img, BAD_COLOR));
+        }
+    }
+
+    return note_head_imgs_red[note.type][note.morebets];
+};
+
+// 帧率统计（调试用）
+let fps_frames = 0;
+let fps_last = performance.now();
+let noise_ms = 0;   // 噪域渲染耗时（平滑值），用来判断瓶颈在不在噪域
+
 const render = () => {
+    if (!running) return;      // 已返回主界面 → 停止渲染循环
+
     resize_canvas();
 
     const t = C.chart.music.currentTime - (C.chart.data.offset + offset_ms / 1000);
@@ -765,7 +2041,8 @@ const render = () => {
         const touches = [];
         for (const [id, pos] of activePointers.entries()) touches.push({ id, pos });
 
-        noiseState.update(noiseAreas, touches, t, w, h, ox, oy, noiseEnabled, dt);
+        // 暂停时不推进噪域模拟（dt 传 0），画面完全冻结
+        noiseState.update(noiseAreas, touches, t, w, h, ox, oy, noiseEnabled, paused ? 0 : dt);
         renderBlockAreas(ctx, noiseAreas, t, w, h, ox, oy);
     }
     // ---------------------------------------
@@ -778,17 +2055,87 @@ const render = () => {
             ...rotate_point(lineX, lineY, h * C.lineh, lineRotate + 180),
         ];
 
-        ctx.drawLine(...lineDrawPos, h * C.linew, `rgba(${C.pcolor.join(", ")}, ${lineAlpha})`);
+        ctx.drawLine(...lineDrawPos, h * C.linew, `rgba(${line_tint_color(line).join(", ")}, ${lineAlpha})`);
         const beatt = line.sec2beat(t);
         const linefp = get_fp(beatt, line.speedEvents);
+        // 判定线方向（Drag 的按住判定要用）：每条判定线每帧只算一次
+        const line_cr = Math.cos(lineRotate * Math.PI / 180);
+        const line_sr = Math.sin(lineRotate * Math.PI / 180);
 
         for (const note of line.notes) {
-            if (note.sect < t && !note.clicked) {
-                play_sound(C.click_sounds[note.type]);
-                note.clicked = true;
+            // 该类型能被点中的最宽窗口（Tap / Hold 有 GOOD 窗口，Drag / Flick 只有 PERFECT 窗口）
+            // 这里刻意不调 judge_windows()：每帧给每个音符新建对象会造成严重 GC 抖动
+            const miss_window = (note.type === C.note.tap || note.type === C.note.hold)
+                ? JUDGE_GOOD
+                : JUDGE_PERFECT;
+
+            if (!note.clicked) {
+                if (autoplay) {
+                    // 自动游玩：到点即命中
+                    if (note.sect < t) {
+                        play_sound(C.click_sounds[note.type]);
+                        note.clicked = true;
+                        note.judge = "PERFECT";
+                        hud_score += 1;
+                        hud_combo++;
+
+                        // 【调试】打击时间日志（autoplay 用音符本身的时间，即理论打击时刻）
+                        log_note_time(note, "PERFECT", note.sect);
+                    }
+                } else if (note.sect + miss_window < t) {
+                    // 手动游玩：过了该类型的判定窗口还没点到 → MISS（断连，不给分）
+                    note.clicked = true;
+                    note.judge = "MISS";
+                    note.judge_time = t;
+                    line.judge_tint = { color: MISS_COLOR, time: performance.now() };
+                    hud_combo = 0;
+                    last_judge = { type: "MISS", time: performance.now() };
+
+                    // 【调试】漏掉的音符也打印（actual = 被判 MISS 的时刻）
+                    log_note_time(note, "MISS", t);
+                }
             }
 
-            if ((!note.is_hold && note.sect < t) || (note.is_hold && note.hold_end_time < t)) {
+            // Drag（黄键）：不需要点按 —— 判定带里有手指按着就算命中（每帧检查）
+            // 被噪域闩住的手指不算（和 Phira 一样，噪域内的接触相当于不存在）
+            if (!autoplay && !note.clicked && note.type === C.note.drag
+                && Math.abs(t - note.sect) <= JUDGE_PERFECT && activePointers.size > 0) {
+                const note_u = note.positionX * C.units.pgrw * w;
+
+                for (const [pid, pos] of activePointers) {
+                    if (noiseState.isBlocked(pid)) continue;
+
+                    const dxp = (pos[0] - ox) - lineX;
+                    const dyp = (pos[1] - oy) - lineY;
+                    const u = dxp * line_cr + dyp * line_sr;
+
+                    if (Math.abs(u - note_u) <= note_width * HIT_RADIUS_FACTOR / 2) {
+                        judge_note(note, t - note.sect);
+                        break;
+                    }
+                }
+            }
+
+            // Hold：起手命中后中途松手（屏幕上没有手指了）→ 算作“没有长按”
+            if (!autoplay && !paused && note.is_hold && note.clicked && !note.hold_failed
+                && note.judge !== "BAD" && note.judge !== "MISS"
+                && t < note.hold_end_time && activePointers.size === 0) {
+                note.hold_failed = true;
+                note.hold_fail_time = t;
+            }
+
+            // 已判 BAD / MISS（或 Hold 没长按）的音符：继续画一小段时间，并跳过常规剔除
+            const is_dead = note.hold_failed
+                || (note.clicked && (note.judge === "BAD" || note.judge === "MISS"));
+
+            if (is_dead) {
+                const dead_since = note.judge_time ?? note.sect;
+                const dead_until = note.is_hold ? Math.max(note.hold_end_time, dead_since) : dead_since;
+
+                if (t - dead_until > DEAD_KEEP_TIME) {
+                    continue;
+                }
+            } else if ((!note.is_hold && note.sect < t) || (note.is_hold && note.hold_end_time < t)) {
                 continue;
             }
 
@@ -806,8 +2153,10 @@ const render = () => {
                 continue;
             }
 
-            const draw_head = note.sect > t;
-            const note_head_img = C.note_head_imgs[note.type][note.morebets];
+            const draw_head = is_dead || note.sect > t;
+            const note_head_img = (is_dead && note.judge === "BAD")
+                ? red_note_head_img(note)
+                : C.note_head_imgs[note.type][note.morebets];
             const this_note_width = note_width * (note.morebets ? (
                 C.note_head_imgs[note.type][1].width
                 / C.note_head_imgs[note.type][0].width
@@ -819,6 +2168,20 @@ const render = () => {
             const note_head_pos = rotate_point(...note_atline_pos, note_fp, l2n_rotate);
 
             const note_draw_rotate = lineRotate + (note.is_above ? 0 : 180);
+
+            // BAD（仅 Tap）：方块变红；
+            // MISS：方块渐隐到透明；
+            // Hold：没长按 / 漏按 → 变 50% 透明度（不是渐隐也不是红）
+            // 以上都没有打击特效
+            if (is_dead) {
+                ctx.save();
+
+                if (note.is_hold && (note.judge === "MISS" || note.hold_failed)) {
+                    ctx.globalAlpha = HOLD_FAIL_ALPHA;
+                } else if (note.judge === "MISS") {
+                    ctx.globalAlpha = Math.max(0, 1 - (t - (note.judge_time ?? note.sect)) / MISS_FADE_TIME);
+                }
+            }
 
             if (draw_head) {
                 ctx.drawCenterRotateImage(
@@ -864,6 +2227,10 @@ const render = () => {
                     note_draw_rotate
                 );
             }
+
+            if (is_dead) {
+                ctx.restore();
+            }
         }
     }
 
@@ -873,9 +2240,13 @@ const render = () => {
         if (effect_t > t) break;
         if (effect_t + effect_dur < t) continue;
 
+        // BAD / MISS 没有打击特效
+        if (note.clicked && (note.judge === "BAD" || note.judge === "MISS")) continue;
+
         const p = (t - effect_t) / effect_dur;
-        const imi = Math.max(0, Math.min(C.hit_fx_imgs.length - 1, Math.floor(p * C.hit_fx_imgs.length)));
-        const im = C.hit_fx_imgs[imi];
+        const fx_imgs = fx_imgs_for(note);
+        const imi = Math.max(0, Math.min(fx_imgs.length - 1, Math.floor(p * fx_imgs.length)));
+        const im = fx_imgs[imi];
         const effect_size = note_width * 1.375 * 1.12;
         const [ pars, pos_getter ] = note.get_click_effect(w, h);
         const [ x, y ] = pos_getter(effect_t);
@@ -894,14 +2265,36 @@ const render = () => {
             ctx.save();
             ctx.translate(x, y);
             const parcenter = rotate_point(0, 0, r, rotate);
-            ctx.fillRectEx(parcenter[0], parcenter[1], size, size, `rgba(${C.pcolor.join(", ")}, ${1.0 - p})`);
+            ctx.fillRectEx(parcenter[0], parcenter[1], size, size, `rgba(${judge_color(note.judge).join(", ")}, ${1.0 - p})`);
             ctx.restore();
         }
     }
 
+    render_hud(ctx, w, h);
+
     ctx.restore();
 
-    requestAnimationFrame(render);
+    // ---- 帧率显示（调试用：不想要就删掉这几行）----
+    fps_frames++;
+    const fps_now = performance.now();
+
+    if (fps_now - fps_last >= 500) {
+        const el = document.querySelector("#debug-info");
+
+        if (el) {
+            el.style.display = "block";
+            const dbg = (typeof ns_debug === "object")
+                ? ` ・ 区${ns_debug.areas} 写${ns_debug.wrote}/${ns_debug.px} a0=${Number.isFinite(ns_debug.a0) ? ns_debug.a0.toFixed(3) : "NaN"} 越${ns_debug.oor} 遮${ns_debug.nrow} ${ns_debug.s}`
+                : "";
+
+            el.textContent = Math.round(fps_frames * 1000 / (fps_now - fps_last)) + " fps ・ 噪域 " + noise_ms.toFixed(1) + " ms" + dbg;
+        }
+
+        fps_frames = 0;
+        fps_last = fps_now;
+    }
+
+    if (running) requestAnimationFrame(render);
 };
 
 CanvasRenderingContext2D.prototype.drawLine = function (x0, y0, x1, y1, w, c) {
@@ -940,8 +2333,419 @@ CanvasRenderingContext2D.prototype.drawBCRotateImage = function (img, x, y, w, h
     this.restore();
 };
 
+// ---- 谱面导入（只在本次运行有效，不做持久化）----
+let imported_chart = null;      // { chart, info, music_url, image_url, label }
+let chart_dirty = false;        // 导入 / 清理过谱面 → 下次开始游戏要重新加载谱面资源
+
+const chart_status_el = document.querySelector("#chart-status");
+const import_message_el = document.querySelector("#import-message");
+const file_input_el = document.querySelector("#file-input");
+
+const set_import_message = (text, is_error = false) => {
+    if (!import_message_el) return;
+
+    import_message_el.textContent = text || "";
+    import_message_el.style.color = is_error ? "#ff7a7a" : "rgba(255, 255, 255, 0.6)";
+};
+
+const set_chart_status = () => {
+    if (!chart_status_el) return;
+
+    chart_status_el.textContent = imported_chart
+        ? `当前谱面：${imported_chart.label}`
+        : "当前谱面：内置（res/chart）";
+};
+
+// 选文件：只弹一次选择器、可多选、不限制类型（accept = */*）
+// 说明：accept 写具体后缀会害死人——Android 选择器按 MIME 过滤，.pez 这类没注册的扩展名会被直接隐藏；
+//       另外连续弹多次选择器会撞上浏览器的“用户激活”限制，所以这里只弹一次，让用户一次选齐。
+const pick_files = () => new Promise(resolve => {
+    if (!file_input_el) {
+        resolve([]);
+        return;
+    }
+
+    file_input_el.value = "";
+    file_input_el.accept = "*/*";
+    file_input_el.multiple = true;
+    file_input_el.onchange = () => resolve(Array.from(file_input_el.files ?? []));
+    file_input_el.oncancel = () => resolve([]);
+    file_input_el.click();
+});
+
+// 读开头几十字节，用魔术字节判断“真实类型”，完全不管扩展名
+const read_head = (file, len = 32) => new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(new Uint8Array(fr.result));
+    fr.onerror = () => reject(new Error("读取失败：" + file.name));
+    fr.readAsArrayBuffer(file.slice(0, len));
+});
+
+const head_is = (bytes, sig) => sig.every((b, i) => bytes[i] === b);
+
+// 返回 zip / json / audio / image / text / other
+const detect_kind = async file => {
+    const name = (file.name || "").toLowerCase();
+    let head = new Uint8Array(0);
+
+    try {
+        head = await read_head(file, 32);
+    } catch (e) {}
+
+    if (head_is(head, [0x50, 0x4b, 0x03, 0x04]) || head_is(head, [0x50, 0x4b, 0x05, 0x06])) return "zip";
+    if (head_is(head, [0x4f, 0x67, 0x67, 0x53])) return "audio";              // OggS
+    if (head_is(head, [0x49, 0x44, 0x33])) return "audio";                    // ID3
+    if (head[0] === 0xff && (head[1] & 0xe0) === 0xe0) return "audio";        // MP3 帧
+    if (head_is(head, [0x89, 0x50, 0x4e, 0x47])) return "image";              // PNG
+    if (head_is(head, [0xff, 0xd8, 0xff])) return "image";                    // JPEG
+
+    if (head_is(head, [0x52, 0x49, 0x46, 0x46])) {                            // RIFF：wav / webp
+        const fourcc = String.fromCharCode(head[8] ?? 0, head[9] ?? 0, head[10] ?? 0, head[11] ?? 0).toUpperCase();
+        if (fourcc === "WAVE") return "audio";
+        if (fourcc === "WEBP") return "image";
+    }
+
+    const head_text = new TextDecoder("utf-8", { fatal: false }).decode(head).replace(/^\uFEFF/, "").trimStart();
+
+    if (head_text.startsWith("{") || head_text.startsWith("[")) return "json";
+
+    if (/\.(json|rpe)$/i.test(name)) return "json";
+    if (/\.pec$/i.test(name)) return "text";
+    if (/\.(ogg|oga|mp3|m4a|aac|wav|flac|opus)$/i.test(name)) return "audio";
+    if (/\.(png|jpe?g|gif|webp|bmp|avif)$/i.test(name)) return "image";
+    if (/\.(ya?ml|txt|ini|cfg|md|htm|html)$/i.test(name)) return "text";
+
+    // 文本文件（可打印字符占比高）当 info 候选，其余扔进 other
+    if (head.length > 0 && !head.some(b => b === 0x00)) return "text";
+
+    return "other";
+};
+
+const read_text = file => new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result));
+    fr.onerror = () => reject(new Error("文件读取失败：" + file.name));
+    fr.readAsText(file, "utf-8");
+});
+
+// 把 .pec / RPE 谱面转成 Phigros chart.json 对象
+// 注意：旧版 lib/pec2json.js 已废弃（它的 PEC 方言与 Phira 实际解析器
+// prpr/src/parse/pec.rs 不一致，导出的文件在 Phira 里会解析失败）。
+// 这里保留入口，缺库时给出明确提示，而不是静默失败。
+const try_parse_pec_or_rpe = text => {
+    const P = window.PEC2JSON;
+    const src = String(text ?? "").replace(/^\uFEFF/, "").trimStart();
+    if (!src) return null;
+
+    if (!P) {
+        console.warn("[导入] 未加载 PEC/RPE 转换器（lib/pec2json.js 已移除），无法导入 .pec / .rpe");
+        return null;
+    }
+
+    // RPE：JSON，带 RPEVersion / BPMList / judgeLineList[i].eventLayers
+    if (src.startsWith("{")) {
+        try {
+            const o = JSON.parse(src);
+            if (o && (o.RPEVersion || o.BPMList) && Array.isArray(o.judgeLineList)) {
+                const r = P.parseRPE(src, "import.rpe");
+                const chart = JSON.parse(r.data);
+                chart.__import_warnings = r.messages ?? [];
+                chart.__import_info = r.info ?? null;
+                return chart;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    // PEC：以 bp / n1~n4 / cv... 开头的纯文本
+    if (!/^\s*[-+0-9.]+\s*$/.test(src) && !/(^|\s)(bp|n[1-4]|cv|cp|cd|ca|cm|cr|cf)\s/.test(src)) return null;
+
+    try {
+        const r = P.parse(src, "import.pec");
+        const chart = JSON.parse(r.data);
+        if (!chart || !Array.isArray(chart.judgeLineList) || chart.judgeLineList.length === 0) return null;
+        chart.__import_warnings = r.messages ?? [];
+        return chart;
+    } catch (e) {
+        console.warn("[PEC 导入]", e);
+        return null;
+    }
+};
+
+// 宽松解析 info：JSON / YAML / TXT 都吃（字段大小写、常见别名都容错）
+const parse_info = (text, is_json) => {
+    const info = { name: "", level: "" };
+
+    if (!text) return info;
+
+    if (is_json) {
+        try {
+            const o = JSON.parse(text);
+            info.name = o.name ?? o.Name ?? o.song ?? o.Song ?? o.title ?? o.Title ?? "";
+            info.level = o.level ?? o.Level ?? o.difficulty ?? o.Difficulty ?? "";
+            return info;
+        } catch (e) {}
+    }
+
+    for (const line of text.split(/\r?\n/)) {
+        const m = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(.+?)\s*$/);
+        if (!m) continue;
+
+        const key = m[1].toLowerCase();
+        const val = m[2].replace(/^["']|["']$/g, "");
+
+        if (!info.name && ["name", "song", "title"].includes(key)) info.name = val;
+        if (!info.level && ["level", "difficulty", "chart"].includes(key)) info.level = val;
+    }
+
+    return info;
+};
+
+const base_name = path => String(path).split("/").pop();
+
+const set_imported = obj => {
+    // 换谱面时把上一份的 Blob URL 释放掉，避免内存泄漏
+    if (imported_chart) {
+        try { URL.revokeObjectURL(imported_chart.music_url); } catch (e) {}
+        try { URL.revokeObjectURL(imported_chart.image_url); } catch (e) {}
+    }
+
+    imported_chart = obj;
+    chart_dirty = true;
+    set_chart_status();
+};
+
+const KIND_LABEL = {
+    zip: "压缩包",
+    json: "json",
+    audio: "音乐",
+    image: "图片",
+    text: "文本",
+    other: "未知"
+};
+
+// 一次选多个文件：自动按内容分类，凑齐「谱面 + 音乐 + 曲绘」即可
+const import_from_files = async files => {
+    const items = [];
+
+    for (const file of files) {
+        items.push({ file, kind: await detect_kind(file) });
+    }
+
+    // 里面有压缩包（zip / pez / 随便什么名字的 zip）就直接解包
+    const zip = items.find(i => i.kind === "zip");
+    if (zip) {
+        return import_from_zip(zip.file);
+    }
+
+    let chart = null;
+    let chart_file = null;
+    let music = null;
+    let image = null;
+    const info = { name: "", level: "" };
+
+    for (const { file, kind } of items) {
+        if (kind === "json") {
+            let obj = null;
+            const raw = await read_text(file);
+
+            try {
+                obj = JSON.parse(raw);
+            } catch (e) {
+                continue;
+            }
+
+            if (obj && Array.isArray(obj.judgeLineList)) {
+                if (obj.judgeLineList.length && obj.judgeLineList[0].eventLayers) {
+                    // RPE 格式：交给转换器转成 Phigros chart
+                    const rpe_chart = chart ? null : try_parse_pec_or_rpe(raw);
+                    if (rpe_chart) {
+                        chart = rpe_chart;
+                        chart_file = file;
+                        continue;
+                    }
+                }
+
+                if (!chart) {
+                    chart = obj;
+                    chart_file = file;
+                }
+            } else {
+                // 不是谱面 → 当 info.json 用
+                const i = parse_info(JSON.stringify(obj), true);
+                if (!info.name && i.name) info.name = i.name;
+                if (!info.level && i.level) info.level = i.level;
+            }
+        } else if (kind === "text") {
+            // 先试着当 .pec / RPE 谱面（Phira 谱面通常是纯文本 .pec）
+            const pec_chart = chart ? null : try_parse_pec_or_rpe(await read_text(file));
+
+            if (pec_chart) {
+                chart = pec_chart;
+                chart_file = file;
+            } else if (!info.name) {
+                const i = parse_info(await read_text(file), false);
+                if (i.name) info.name = i.name;
+                if (i.level) info.level = i.level;
+            }
+        } else if (kind === "audio") {
+            if (!music) music = file;
+        } else if (kind === "image") {
+            if (!image) image = file;
+        }
+    }
+
+    const found = items.map(i => `${base_name(i.file.name)}（${KIND_LABEL[i.kind] ?? i.kind}）`).join("、");
+
+    if (!chart) throw new Error(`没识别到谱面（识别到：${found}）`);
+    if (!music) throw new Error(`没识别到音乐文件（识别到：${found}）`);
+    if (!image) throw new Error(`没识别到曲绘图片（识别到：${found}）`);
+
+    if (!info.name) {
+        info.name = chart.name ?? chart.Name ?? base_name(chart_file.name).replace(/\.[^.]+$/, "");
+    }
+
+    if (!info.level) {
+        info.level = chart.level ?? chart.Level ?? "";
+    }
+
+    set_imported({
+        chart,
+        info,
+        music_url: URL.createObjectURL(music),
+        image_url: URL.createObjectURL(image),
+        label: `${info.name}${info.level ? " / " + info.level : ""}`
+    });
+};
+
+const import_from_zip = async file => {
+    if (typeof JSZip === "undefined") {
+        throw new Error("JSZip 没加载成功，无法解包 zip / pez（检查 lib/jszip.min.js）");
+    }
+
+    set_import_message(`正在解包 ${file.name} ...`);
+
+    const zip = await JSZip.loadAsync(file);
+    const entries = Object.values(zip.files).filter(f => !f.dir);
+
+    if (entries.length === 0) throw new Error("压缩包是空的");
+
+    // 谱面：优先 chart.json，否则找任何一个含 judgeLineList 的 json
+    let chart = null;
+    const chart_entry = entries.find(e => base_name(e.name).toLowerCase() === "chart.json")
+        ?? entries.find(e => e.name.toLowerCase().endsWith(".json"));
+
+    if (chart_entry) {
+        try {
+            const c = JSON.parse(await chart_entry.async("string"));
+            if (c && Array.isArray(c.judgeLineList)) chart = c;
+        } catch (e) {}
+    }
+
+    if (!chart) {
+        for (const e of entries) {
+            if (!e.name.toLowerCase().endsWith(".json")) continue;
+
+            try {
+                const c = JSON.parse(await e.async("string"));
+                if (c && Array.isArray(c.judgeLineList)) { chart = c; break; }
+            } catch (err) {}
+        }
+    }
+
+    if (!chart) throw new Error("压缩包里找不到谱面（需要 chart.json 或含 judgeLineList 的 json）");
+
+    // 音乐 / 曲绘：优先约定名，其次按扩展名
+    const music_entry = entries.find(e => /^music\.(ogg|mp3|m4a|wav)$/i.test(base_name(e.name)))
+        ?? entries.find(e => /\.(ogg|mp3|m4a|wav)$/i.test(base_name(e.name)));
+    const image_entry = entries.find(e => /^image\.(png|jpe?g|webp)$/i.test(base_name(e.name)))
+        ?? entries.find(e => /\.(png|jpe?g|webp)$/i.test(base_name(e.name)));
+
+    if (!music_entry) throw new Error("压缩包里找不到音乐（.ogg / .mp3）");
+    if (!image_entry) throw new Error("压缩包里找不到曲绘（.png / .jpg）");
+
+    // info：info.json / info.yml / info.yaml / info.txt
+    let info = { name: "", level: "" };
+    const info_entry = entries.find(e => /^info\.(json|ya?ml|txt)$/i.test(base_name(e.name)));
+
+    if (info_entry) {
+        info = parse_info(
+            await info_entry.async("string"),
+            /\.json$/i.test(base_name(info_entry.name))
+        );
+    }
+
+    if (!info.name) info.name = file.name.replace(/\.(zip|pez)$/i, "");
+
+    set_imported({
+        chart,
+        info,
+        music_url: URL.createObjectURL(await music_entry.async("blob")),
+        image_url: URL.createObjectURL(await image_entry.async("blob")),
+        label: `${info.name}${info.level ? " / " + info.level : ""}`
+    });
+};
+
+const on_import_click = async () => {
+    try {
+        set_import_message("正在打开文件选择器...");
+
+        // 2.5 秒还没选完，大概率是选择器压根没弹出来 → 直接给诊断提示
+        const hint_timer = setTimeout(() => {
+            set_import_message('选择器没弹出来？说明当前 WebView 不支持 <input type="file">，需要改走 WebCatX 原生接口', true);
+        }, 2500);
+
+        // 不限制类型、可多选：可以只选一个 zip/pez，
+        // 也可以一次把 chart.json + 音乐 + 曲绘（+ info）全选上，由网页自己分类
+        const files = await pick_files();
+
+        clearTimeout(hint_timer);
+
+        if (files.length === 0) {
+            set_import_message("");
+            return;
+        }
+
+        set_import_message(`已选择 ${files.length} 个文件，正在识别...`);
+
+        await import_from_files(files);
+
+        set_import_message("导入成功，点「开始游戏」生效");
+    } catch (e) {
+        console.error(e);
+        set_import_message("导入失败：" + (e && e.message ? e.message : e), true);
+    }
+};
+
+const on_clear_click = () => {
+    if (imported_chart) {
+        try { URL.revokeObjectURL(imported_chart.music_url); } catch (e) {}
+        try { URL.revokeObjectURL(imported_chart.image_url); } catch (e) {}
+    }
+
+    imported_chart = null;
+    chart_dirty = true;
+
+    set_chart_status();
+    set_import_message("已清理导入的谱面，下次开始游戏用内置谱面（res/chart）");
+};
+
+const import_btn = document.querySelector("#import-button");
+const clear_btn = document.querySelector("#clear-import-button");
+
+if (import_btn) import_btn.onclick = on_import_click;
+if (clear_btn) clear_btn.onclick = on_clear_click;
+
+set_chart_status();
+
 const load_game = async () => {
     resize_canvas();
+
+    // 重新加载时（例如换了导入的谱面）先清掉上一次的音乐元素，避免叠加
+    if (C.chart.music?.parentNode) {
+        try { C.chart.music.pause(); } catch (e) {}
+        C.chart.music.remove();
+    }
 
     C.click_sounds[C.note.tap] = await step(onProgress => load_audio("res/click.ogg", onProgress), "正在加载点击音效...");
     C.click_sounds[C.note.hold] = C.click_sounds[C.note.tap];
@@ -963,11 +2767,24 @@ const load_game = async () => {
     [C.note_imgs.hold_head, C.note_imgs.hold_body, C.note_imgs.hold_tail] = clip_hold(C.note_imgs.hold, C.respack_info.holdAtlas);
     [C.note_imgs.hold_mh_head, C.note_imgs.hold_mh_body, C.note_imgs.hold_mh_tail] = clip_hold(C.note_imgs.hold_mh, C.respack_info.holdAtlasMH);
 
-    C.chart.info = await step(onProgress => load_json("res/chart/info.json", onProgress), "正在读取谱面信息...");
-    C.chart.data = await step(onProgress => load_json("res/chart/chart.json", onProgress), "正在下载谱面 chart.json...");
-    noiseAreas = parseBlockAreasFromChart(C.chart.data);
-    C.chart.music = await step(onProgress => load_audioele("res/chart/music.ogg", onProgress), "正在加载谱面音乐...");
-    C.chart.image = get_blur_img(await step(() => load_img("res/chart/image.png"), "正在加载曲绘..."), 0.05);
+    if (imported_chart) {
+        // 导入的谱面：谱面 JSON 已经是对象，音乐/曲绘用 Blob URL
+        C.chart.info = imported_chart.info;
+        C.chart.data = imported_chart.chart;
+        set_progress("正在初始化导入的谱面...");
+        noiseAreas = parseBlockAreasFromChart(C.chart.data);
+        C.chart.music = await step(() => load_audioele(imported_chart.music_url), "正在加载谱面音乐...");
+        C.chart.image = get_blur_img(await step(() => load_img(imported_chart.image_url)), "正在加载曲绘...");
+    } else {
+        C.chart.info = await step(onProgress => load_json("res/chart/info.json", onProgress), "正在读取谱面信息...");
+        C.chart.data = await step(onProgress => load_json("res/chart/chart.json", onProgress), "正在下载谱面 chart.json...");
+        noiseAreas = parseBlockAreasFromChart(C.chart.data);
+        C.chart.music = await step(onProgress => load_audioele("res/chart/music.ogg", onProgress), "正在加载谱面音乐...");
+        C.chart.image = get_blur_img(await step(() => load_img("res/chart/image.png"), "正在加载曲绘..."), 0.05);
+    }
+
+    hud_total_notes = 0;      // 谱面可能换了，音符总数重新统计
+    hit_fx_imgs_blue = null;
 
     C.note_head_imgs = {
         [C.note.tap]: [C.note_imgs.click, C.note_imgs.click_mh],
@@ -982,22 +2799,12 @@ const load_game = async () => {
     C.hit_fx = await step(() => load_img("res/hit_fx.png"), "正在加载打击特效...");
     set_progress("正在生成打击特效...");
 
-    for (let j = 0; j < C.respack_info.hitFx[1]; j++) {
-        for (let i = 0; i < C.respack_info.hitFx[0]; i++) {
-            C.hit_fx_imgs.push(
-                cv_put_color(clip_block_img(
-                    C.hit_fx,
-                    (i / C.respack_info.hitFx[0]) * C.hit_fx.width,
-                    (j / C.respack_info.hitFx[1]) * C.hit_fx.height,
-                    ((i + 1) / C.respack_info.hitFx[0]) * C.hit_fx.width,
-                    ((j + 1) / C.respack_info.hitFx[1]) * C.hit_fx.height
-                ), C.pcolor)
-            );
-        }
-    }
+    C.hit_fx_imgs = build_hit_fx_imgs(C.pcolor);
 
     C.chart.music.style.display = "none";
     document.body.appendChild(C.chart.music);
+
+    await step(onProgress => apply_font(font_index, onProgress), "正在加载字体...");
 
     set_progress("正在初始化谱面...");
 
@@ -1022,7 +2829,8 @@ const load_game = async () => {
         };
 
         init_speed_events(line.speedEvents);
-        line.notes = merge_notes(line.notesAbove, line.notesBelow);
+        // ?? [] 是为了“同一份谱面对象被加载第二次”时不报错（导入的谱面重复加载时会走到）
+        line.notes = merge_notes(line.notesAbove ?? [], line.notesBelow ?? []);
         init_note_fp(line.notes, line.speedEvents);
 
         for (const note of line.notes) {
@@ -1102,16 +2910,10 @@ const load_game = async () => {
     document.querySelector("#loading-screen").classList.add("hidden");
     document.querySelector("#start-screen").classList.remove("hidden");
 
-    document.querySelector("#start-button").onclick = () => {
-        document.querySelector("#start-screen").classList.add("hidden");
+    chart_dirty = false;
+    reset_play_state();
 
-        if (actx.state === "suspended") {
-            actx.resume().catch(e => console.warn("音频恢复失败", e));
-        }
-
-        C.chart.music.play().catch(e => console.warn("音乐播放失败", e));
-        render();
-    };
+    document.querySelector("#start-button").onclick = () => start_or_reload();
 };
 
 window.onload = () => {

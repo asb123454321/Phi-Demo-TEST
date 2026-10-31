@@ -1,0 +1,9 @@
+#
+Name: ハテ
+Song: ハテ.rNFrums.ogg
+Picture: ハテ.rNFrums.png
+Chart: ハテ.rNFrums.json
+Level: AT Lv.17.9
+Composer: rN || Frums
+Illustrator: 宙風みけ || rN
+Charter: the end of ever.

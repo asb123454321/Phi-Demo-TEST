@@ -1,0 +1,738 @@
+//! Configuration module of the playing environment.\
+//! e.g. player name, volume, speed, autoplay, etc.
+
+use bitflags::bitflags;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+
+pub const PLAYBACK_SPEED_MIN: f32 = 0.05;
+pub const PLAYBACK_SPEED_MAX: f32 = 10.0;
+pub const PLAYBACK_SPEED_STEP: f32 = 0.05;
+pub const NOTE_FLOW_SPEED_MIN: f32 = 0.1;
+pub const NOTE_FLOW_SPEED_MAX: f32 = 20.0;
+pub const NOTE_FLOW_SPEED_STEP: f32 = 0.05;
+pub const JUDGEMENT_RANGE_HORIZON_MIN: f32 = 0.1;
+pub const JUDGEMENT_RANGE_HORIZON_MAX: f32 = 30.0;
+pub const JUDGEMENT_RANGE_HORIZON_STEP: f32 = 0.1;
+pub const JUDGEMENT_RANGE_ALPHA_MIN: f32 = 0.0;
+pub const JUDGEMENT_RANGE_ALPHA_MAX: f32 = 0.5;
+pub const JUDGEMENT_RANGE_ALPHA_STEP: f32 = 0.01;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgementMode {
+    #[default]
+    Phira,
+    PhigrosReplica,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgementRangeAnchor {
+    #[default]
+    JudgeLine,
+    Note,
+    Both,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct TapJudgementRangeDebug {
+    pub enabled: bool,
+    pub perfect: bool,
+    pub good: bool,
+    pub bad: bool,
+    pub miss: bool,
+}
+
+impl Default for TapJudgementRangeDebug {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            perfect: true,
+            good: true,
+            bad: true,
+            miss: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct HoldJudgementRangeDebug {
+    pub enabled: bool,
+    pub head_perfect: bool,
+    pub head_good: bool,
+    pub head_miss: bool,
+    pub tail: bool,
+}
+
+impl Default for HoldJudgementRangeDebug {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            head_perfect: true,
+            head_good: true,
+            head_miss: true,
+            tail: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgementRangeDebug {
+    pub enabled: bool,
+    pub anchor: JudgementRangeAnchor,
+    pub horizon: f32,
+    pub fill_alpha: f32,
+    pub tap: TapJudgementRangeDebug,
+    pub hold: HoldJudgementRangeDebug,
+    pub drag: bool,
+    pub flick: bool,
+}
+
+impl Default for JudgementRangeDebug {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            anchor: JudgementRangeAnchor::JudgeLine,
+            horizon: 2.0,
+            fill_alpha: 0.12,
+            tap: TapJudgementRangeDebug::default(),
+            hold: HoldJudgementRangeDebug::default(),
+            drag: true,
+            flick: true,
+        }
+    }
+}
+
+/// Cosmetic timing HUD; positions are fractions of the screen half-width/height.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TimingBarConfig {
+    pub enabled: bool,
+    pub record_counts: bool,
+    pub curved: bool,
+    pub record_seconds: f32,
+    pub x: f32,
+    pub y: f32,
+    pub size: f32,
+}
+impl Default for TimingBarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            record_counts: true,
+            curved: false,
+            record_seconds: 3.,
+            x: 0.,
+            y: -0.65,
+            size: 100.,
+        }
+    }
+}
+impl TimingBarConfig {
+    pub fn retention_seconds(&self) -> f64 {
+        if self.record_seconds.is_finite() {
+            self.record_seconds.clamp(0.5, 10.) as f64
+        } else {
+            3.
+        }
+    }
+}
+
+pub static TIPS: Lazy<Vec<String>> = Lazy::new(|| include_str!("tips.txt").split('\n').map(str::to_owned).collect());
+
+bitflags! {
+    #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Debug)]
+    #[serde(transparent)]
+    pub struct Mods: i32 {
+        const AUTOPLAY = 0x0001;
+        const FLIP_X = 0x0002;
+        const FADE_OUT = 0x0004;
+        const FADE_IN = 0x0008;
+        const NIGHTCORE = 0x0010;
+        const RAINBOW = 0x0020;
+        const NO_SHADER = 0x0040;
+        const INSTANT_DEATH_AP = 0x0080;
+        const INSTANT_DEATH_FC = 0x0100;
+
+        const UNRATED = Self::AUTOPLAY.bits() | Self::NO_SHADER.bits();
+    }
+}
+
+impl Mods {
+    pub fn toggle_mod(&mut self, flag: Mods) {
+        if self.contains(flag) {
+            self.remove(flag);
+        } else {
+            for &conflict in Mods::conflicts(flag) {
+                self.remove(conflict);
+            }
+            self.insert(flag);
+        }
+    }
+    fn conflicts(flag: Mods) -> &'static [Mods] {
+        match flag {
+            Mods::FADE_IN => &[Mods::FADE_OUT],
+            Mods::FADE_OUT => &[Mods::FADE_IN],
+            Mods::INSTANT_DEATH_AP => &[Mods::INSTANT_DEATH_FC],
+            Mods::INSTANT_DEATH_FC => &[Mods::INSTANT_DEATH_AP],
+            _ => &[],
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct Config {
+    #[serde(rename = "adjust_time_new")]
+    pub adjust_time: bool,
+    pub aggressive: bool,
+    pub ap_fc_indicator: bool,
+    pub auto_export_play_report: bool,
+    /// Include high-volume raw touch diagnostics in the exported play report.
+    /// Disabled by default because it records one trajectory sample per active
+    /// finger per frame and can make reports substantially larger.
+    pub touch_input_debug_report: bool,
+    pub aspect_ratio: Option<f32>,
+    pub audio_buffer_size: Option<u32>,
+    pub chart_debug: bool,
+    pub disable_effect: bool,
+    pub double_click_to_pause: bool,
+    pub double_hint: bool,
+    pub fullscreen_mode: bool,
+    pub fxaa: bool,
+    pub interactive: bool,
+    pub judgement_range_debug: JudgementRangeDebug,
+    pub timing_bar: TimingBarConfig,
+    /// Play hitsounds at chart time in the audio callback, independent of judgement.
+    pub correct_sound: bool,
+    /// Master switch for recording; viewing existing replays remains available.
+    pub replay_recording_enabled: bool,
+    /// Ignore touch position, while retaining timing and gesture requirements.
+    pub fullscreen_judgement: bool,
+    /// Explicit opt-in for local records of fullscreen manual runs.
+    pub fullscreen_judgement_counts_local_score: bool,
+    /// Phigros block-area rendering and audio switches.
+    pub noise_area: crate::noise_area::NoiseAreaConfig,
+    pub judgement_mode: JudgementMode,
+    pub custom_judgement: crate::custom_judgement::CustomJudgementConfig,
+    pub phigros_strict_judgement: bool,
+    /// Runtime-only course flag; never modifies saved normal-play preferences.
+    #[serde(skip)]
+    pub challenge_mode: bool,
+    pub mods: Mods,
+    pub mp_address: String,
+    pub mp_enabled: bool,
+    pub note_scale: f32,
+    /// Global visual flow multiplier, edited from any chart Mods panel.
+    pub note_flow_speed: f32,
+    pub offline_mode: bool,
+    pub offset: f32,
+    pub particle: bool,
+    pub player_name: String,
+    pub player_rks: f32,
+    pub preferred_sample_rate: Option<u32>,
+    pub res_pack_path: Option<String>,
+    pub sample_count: u32,
+    /// Global visual Hold assist; enabled runs cannot upload scores.
+    pub shorten_holds: bool,
+    /// Predict the local library in a low-duty background worker.
+    pub ai_auto_predict: bool,
+    /// Global gate; per-chart intervals are retained when disabled.
+    pub auto_flip_enabled: bool,
+    /// Cosmetic burst when a Hold head is successfully judged.
+    pub hold_head_effect: bool,
+    pub show_acc: bool,
+    pub show_avg_fps: bool,
+    pub speed: f32,
+    /// Practice-only tempo changes that retain the original music pitch.
+    pub practice_preserve_pitch: bool,
+    pub normal_preserve_pitch: bool,
+    pub normal_note_flow_inverse: bool,
+    /// Exercise-only runtime multiplier; never persists into normal play.
+    #[serde(skip, default = "default_practice_judgement_multiplier")]
+    pub practice_judgement_multiplier: f32,
+    pub touch_debug: bool,
+    pub use_keyboard: bool,
+    pub volume_bgm: f32,
+    pub volume_music: f32,
+    pub volume_sfx: f32,
+
+    // for compatibility
+    autoplay: Option<bool>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            adjust_time: false,
+            aggressive: true,
+            ap_fc_indicator: true,
+            auto_export_play_report: false,
+            touch_input_debug_report: false,
+            aspect_ratio: None,
+            audio_buffer_size: None,
+            chart_debug: false,
+            disable_effect: false,
+            double_click_to_pause: true,
+            double_hint: true,
+            fxaa: false,
+            interactive: true,
+            judgement_range_debug: JudgementRangeDebug::default(),
+            timing_bar: TimingBarConfig::default(),
+            correct_sound: false,
+            replay_recording_enabled: true,
+            fullscreen_judgement: false,
+            fullscreen_judgement_counts_local_score: false,
+            noise_area: crate::noise_area::NoiseAreaConfig::default(),
+            judgement_mode: JudgementMode::Phira,
+            custom_judgement: Default::default(),
+            phigros_strict_judgement: false,
+            challenge_mode: false,
+            mods: Mods::default(),
+            mp_address: "mp2.phira.cn:12345".to_owned(),
+            mp_enabled: false,
+            note_scale: 1.0,
+            note_flow_speed: 1.,
+            offline_mode: false,
+            fullscreen_mode: false,
+            offset: 0.,
+            particle: true,
+            player_name: "Mivik".to_string(),
+            player_rks: 15.,
+            preferred_sample_rate: None,
+            res_pack_path: None,
+            sample_count: 1,
+            shorten_holds: false,
+            ai_auto_predict: false,
+            auto_flip_enabled: true,
+            hold_head_effect: false,
+            show_acc: false,
+            show_avg_fps: false,
+            speed: 1.,
+            practice_preserve_pitch: false,
+            normal_preserve_pitch: false,
+            normal_note_flow_inverse: false,
+            practice_judgement_multiplier: 1.,
+            touch_debug: false,
+            use_keyboard: false,
+            volume_music: 1.,
+            volume_sfx: 1.,
+            volume_bgm: 1.,
+
+            autoplay: None,
+        }
+    }
+}
+
+fn default_practice_judgement_multiplier() -> f32 {
+    1.
+}
+
+impl Config {
+    pub fn judgement_multiplier(&self) -> f64 {
+        let v = self.practice_judgement_multiplier;
+        if v.is_finite() && v > 0. {
+            v.clamp(0.1, 20.) as f64
+        } else {
+            1.
+        }
+    }
+    pub fn effective_custom_judgement(&self) -> std::borrow::Cow<'_, crate::custom_judgement::Scheme> {
+        let scheme = self.custom_judgement.effective();
+        let multiplier = self.judgement_multiplier();
+        if multiplier == 1. {
+            std::borrow::Cow::Borrowed(scheme)
+        } else {
+            let mut scaled = scheme.clone();
+            for b in &mut scaled.boundaries_ms {
+                *b *= multiplier;
+            }
+            std::borrow::Cow::Owned(scaled)
+        }
+    }
+
+    pub fn enable_challenge(&mut self) {
+        self.challenge_mode = true;
+        self.judgement_mode = JudgementMode::PhigrosReplica;
+        self.phigros_strict_judgement = true;
+        self.autoplay = None;
+        self.mods.remove(Mods::AUTOPLAY);
+    }
+    pub fn apply_challenge_chart(&self, settings: &mut crate::chart_play::ChartPlaySettings) {
+        if self.challenge_mode {
+            settings.note_conversion = crate::chart_play::NoteConversion::Original;
+        }
+    }
+
+    #[inline]
+    pub fn flick_judgement_mode(&self) -> JudgementMode {
+        self.judgement_mode
+    }
+
+    /// Whether gameplay uses any non-default judgement engine. Such results
+    /// are intentionally excluded from online score upload.
+    #[inline]
+    pub fn has_custom_judgement(&self) -> bool {
+        self.judgement_mode != JudgementMode::Phira
+    }
+
+    /// Course runs retain the original spatial judgement without changing saved preferences.
+    #[inline]
+    pub fn fullscreen_judgement_enabled(&self) -> bool {
+        self.fullscreen_judgement && !self.challenge_mode
+    }
+
+    /// Whether a setting makes an online result ineligible for upload.
+    pub fn blocks_score_upload(&self) -> bool {
+        self.fullscreen_judgement_enabled()
+            || self.has_custom_judgement()
+            || self.judgement_range_debug.enabled
+            || self.touch_input_debug_report
+            || self.shorten_holds
+    }
+
+    /// All online charts use the replica's isolated local record store, regardless of settings.
+    pub fn online_replica_active(&self, online: bool, _chart_assist: bool) -> bool {
+        online
+    }
+
+    /// Manual runs may save personal records for both local and online charts.
+    /// Upload eligibility is separate; callers exclude practice and viewing modes.
+    pub fn saves_run_record(&self) -> bool {
+        !self.autoplay()
+            && (!self.fullscreen_judgement_enabled() || self.fullscreen_judgement_counts_local_score)
+            && (self.judgement_mode != JudgementMode::Custom || self.custom_judgement.effective().counts_local_score)
+    }
+
+    pub fn preserve_pitch_for(&self, practice: bool) -> bool {
+        if practice {
+            self.practice_preserve_pitch
+        } else {
+            self.normal_preserve_pitch
+        }
+    }
+
+    pub fn note_flow_inverse_for(&self, practice: bool, practice_inverse: bool) -> bool {
+        if practice {
+            practice_inverse
+        } else {
+            self.normal_note_flow_inverse
+        }
+    }
+
+    /// Keep malformed/legacy saved data away from the renderer.
+    pub fn global_note_flow_speed(&self) -> f32 {
+        if self.note_flow_speed.is_finite() {
+            self.note_flow_speed.clamp(0.1, 5.)
+        } else {
+            1.
+        }
+    }
+
+    /// Practice retains its independent multiplier (including the inverse-speed lock).
+    pub fn effective_note_flow_speed(&self, practice_multiplier: f32) -> f32 {
+        self.global_note_flow_speed() * practice_multiplier
+    }
+
+    pub fn init(&mut self) {
+        // Removed split-Flick and online-local switches deserialize as ignored legacy keys.
+        self.speed = if self.speed.is_finite() { self.speed.clamp(0.5, 2.) } else { 1. };
+        self.note_flow_speed = self.global_note_flow_speed();
+        self.judgement_range_debug.horizon = self
+            .judgement_range_debug
+            .horizon
+            .clamp(JUDGEMENT_RANGE_HORIZON_MIN, JUDGEMENT_RANGE_HORIZON_MAX);
+        self.judgement_range_debug.fill_alpha = self
+            .judgement_range_debug
+            .fill_alpha
+            .clamp(JUDGEMENT_RANGE_ALPHA_MIN, JUDGEMENT_RANGE_ALPHA_MAX);
+        if let Some(flag) = self.autoplay {
+            self.mods.set(Mods::AUTOPLAY, flag);
+        }
+        #[cfg(target_env = "ohos")]
+        {
+            // Due to the fucking poor performance of the Maloon GPU, the sample count must be set to 1.
+            self.sample_count = 1;
+        }
+    }
+
+    #[inline]
+    pub fn has_mod(&self, m: Mods) -> bool {
+        self.mods.contains(m)
+    }
+
+    #[inline]
+    pub fn autoplay(&self) -> bool {
+        self.has_mod(Mods::AUTOPLAY)
+    }
+
+    #[inline]
+    pub fn flip_x(&self) -> bool {
+        self.has_mod(Mods::FLIP_X)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fullscreen_records_require_explicit_opt_in_and_never_upload() {
+        let mut config = Config::default();
+        assert!(!config.fullscreen_judgement && !config.fullscreen_judgement_counts_local_score);
+        config.fullscreen_judgement = true;
+        assert!(!config.saves_run_record());
+        assert!(config.blocks_score_upload());
+        config.fullscreen_judgement_counts_local_score = true;
+        assert!(config.saves_run_record());
+        assert!(config.blocks_score_upload());
+        config.mods.insert(Mods::AUTOPLAY);
+        assert!(!config.saves_run_record());
+    }
+    #[test]
+    fn legacy_settings_default_off_and_fullscreen_preferences_round_trip() {
+        let old: Config = serde_json::from_str("{}").unwrap();
+        assert!(!old.fullscreen_judgement && !old.fullscreen_judgement_counts_local_score);
+        let config = Config {
+            fullscreen_judgement: true,
+            fullscreen_judgement_counts_local_score: true,
+            ..Default::default()
+        };
+        let restored: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert!(restored.fullscreen_judgement_enabled());
+        assert!(restored.saves_run_record());
+    }
+    #[test]
+    fn fullscreen_does_not_override_custom_score_restriction_or_course_rules() {
+        let mut config = Config {
+            fullscreen_judgement: true,
+            fullscreen_judgement_counts_local_score: true,
+            judgement_mode: JudgementMode::Custom,
+            ..Default::default()
+        };
+        assert!(!config.saves_run_record());
+        config.enable_challenge();
+        assert!(!config.fullscreen_judgement_enabled());
+        assert!(config.fullscreen_judgement);
+        assert!(config.phigros_strict_judgement);
+    }
+    #[test]
+    fn legacy_global_mode_is_inherited_by_flick() {
+        let mut config = Config {
+            judgement_mode: JudgementMode::PhigrosReplica,
+            ..Default::default()
+        };
+        config.init();
+        assert_eq!(config.flick_judgement_mode(), JudgementMode::PhigrosReplica);
+    }
+
+    #[test]
+    fn strict_switch_alone_does_not_change_phira_or_upload_eligibility() {
+        let config = Config {
+            phigros_strict_judgement: true,
+            ..Default::default()
+        };
+        assert!(!config.has_custom_judgement());
+    }
+
+    #[test]
+    fn one_selector_controls_all_note_types() {
+        let mut config = Config::default();
+        for mode in [JudgementMode::PhigrosReplica, JudgementMode::Phira] {
+            config.judgement_mode = mode;
+            assert_eq!(config.flick_judgement_mode(), mode);
+            assert_eq!(config.has_custom_judgement(), mode != JudgementMode::Phira);
+        }
+    }
+
+    #[test]
+    fn judgement_range_overlay_blocks_upload_without_changing_engine_mode() {
+        let mut config = Config::default();
+        assert!(!config.has_custom_judgement());
+        assert!(!config.blocks_score_upload());
+        config.judgement_range_debug.enabled = true;
+        assert!(!config.has_custom_judgement());
+        assert!(config.blocks_score_upload());
+    }
+
+    #[test]
+    fn touch_input_debug_report_blocks_upload() {
+        let mut config = Config::default();
+        assert!(!config.blocks_score_upload());
+        config.touch_input_debug_report = true;
+        assert!(config.blocks_score_upload());
+    }
+
+    #[test]
+    fn judgement_range_values_are_sanitized_when_loading_old_or_edited_data() {
+        let mut config = Config::default();
+        config.judgement_range_debug.horizon = 999.;
+        config.judgement_range_debug.fill_alpha = -2.;
+        config.init();
+        assert_eq!(config.judgement_range_debug.horizon, JUDGEMENT_RANGE_HORIZON_MAX);
+        assert_eq!(config.judgement_range_debug.fill_alpha, JUDGEMENT_RANGE_ALPHA_MIN);
+    }
+}
+
+#[cfg(test)]
+mod challenge_tests {
+    use super::*;
+    use crate::chart_play::{AutoFlipInterval, ChartPlaySettings, NoteConversion};
+    #[test]
+    fn mandatory_overrides_are_isolated_and_keep_other_preferences() {
+        let original = Config {
+            mods: Mods::AUTOPLAY | Mods::FLIP_X | Mods::NO_SHADER,
+            shorten_holds: true,
+            auto_flip_enabled: true,
+            speed: 0.75,
+            volume_music: 0.3,
+            ..Default::default()
+        };
+        let mut course = original.clone();
+        course.enable_challenge();
+        assert!(original.autoplay());
+        assert_eq!(original.judgement_mode, JudgementMode::Phira);
+        assert!(!course.autoplay());
+        assert!(course.phigros_strict_judgement);
+        assert_eq!(course.judgement_mode, JudgementMode::PhigrosReplica);
+        assert_eq!(course.flick_judgement_mode(), JudgementMode::PhigrosReplica);
+        assert!(course.mods.contains(Mods::FLIP_X | Mods::NO_SHADER));
+        assert_eq!(course.speed, original.speed);
+        assert_eq!(course.volume_music, original.volume_music);
+        assert!(course.shorten_holds && course.auto_flip_enabled);
+        assert!(serde_json::to_value(&course).unwrap().get("challengeMode").is_none());
+        for mode in [NoteConversion::Tap, NoteConversion::Drag, NoteConversion::Flick] {
+            let mut settings = ChartPlaySettings {
+                note_conversion: mode,
+                auto_flip_intervals: vec![AutoFlipInterval { start: 1., end: 2. }],
+            };
+            original.apply_challenge_chart(&mut settings);
+            assert_eq!(settings.note_conversion, mode);
+            course.apply_challenge_chart(&mut settings);
+            assert_eq!(settings.note_conversion, NoteConversion::Original);
+            assert_eq!(settings.auto_flip_intervals.len(), 1);
+        }
+    }
+    #[test]
+    fn legacy_autoplay_cannot_restore_itself_inside_course() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({"autoplay":true})).unwrap();
+        config.init();
+        assert!(config.autoplay());
+        config.enable_challenge();
+        config.init();
+        assert!(!config.autoplay());
+    }
+}
+
+#[cfg(test)]
+mod speed_tests {
+    use super::Config;
+
+    #[test]
+    fn playback_and_global_flow_preferences_persist_across_loading() {
+        let mut config: Config = serde_json::from_str(r#"{"speed":0.75,"noteFlowSpeed":1.5}"#).unwrap();
+        config.init();
+        assert_eq!(config.speed, 0.75);
+        assert_eq!(config.note_flow_speed, 1.5);
+        let mut restored: Config = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        restored.init();
+        assert_eq!(restored.speed, 0.75);
+        assert_eq!(restored.note_flow_speed, 1.5);
+        assert_eq!(serde_json::from_str::<Config>("{}").unwrap().note_flow_speed, 1.);
+    }
+
+    #[test]
+    fn flow_multiplies_practice_without_changing_playback_or_clipping_the_product() {
+        let config = Config {
+            speed: 0.5,
+            note_flow_speed: 5.,
+            ..Default::default()
+        };
+        assert_eq!(config.effective_note_flow_speed(1.), 5.);
+        assert_eq!(config.effective_note_flow_speed(2.), 10.);
+        assert_eq!(config.effective_note_flow_speed(20.), 100.);
+        assert_eq!(config.speed, 0.5);
+        let config = Config {
+            note_flow_speed: 1.5,
+            ..Default::default()
+        };
+        assert!((config.effective_note_flow_speed(0.8) - 1.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn invalid_speed_preferences_are_sanitized() {
+        for (playback, flow, expected_playback, expected_flow) in [(f32::NAN, f32::INFINITY, 1., 1.), (0., -1., 0.5, 0.1), (100., 100., 2., 5.)] {
+            let mut config = Config {
+                speed: playback,
+                note_flow_speed: flow,
+                ..Default::default()
+            };
+            config.init();
+            assert_eq!(config.speed, expected_playback);
+            assert_eq!(config.note_flow_speed, expected_flow);
+        }
+    }
+}
+
+#[cfg(test)]
+mod correct_sound_config_tests {
+    use super::*;
+    #[test]
+    fn old_preferences_keep_correct_sound_disabled() {
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.correct_sound);
+        config.correct_sound = true;
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(serde_json::from_str::<Config>(&json).unwrap().correct_sound);
+    }
+}
+
+#[cfg(test)]
+mod practice_judgement_tests {
+    use super::*;
+    #[test]
+    fn practice_interval_is_runtime_only_and_custom_presets_remain_unchanged() {
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.judgement_multiplier(), 1.);
+        let original = config.custom_judgement.effective().boundaries_ms.clone();
+        config.practice_judgement_multiplier = 3.;
+        let scaled = config.effective_custom_judgement();
+        for (a, b) in scaled.boundaries_ms.iter().zip(&original) {
+            assert_eq!(*a, *b * 3.);
+        }
+        assert_eq!(config.custom_judgement.effective().boundaries_ms, original);
+        let saved = serde_json::to_string(&config).unwrap();
+        assert!(!saved.contains("practiceJudgementMultiplier"));
+        assert_eq!(serde_json::from_str::<Config>(&saved).unwrap().judgement_multiplier(), 1.);
+        config.practice_judgement_multiplier = f32::NAN;
+        assert_eq!(config.judgement_multiplier(), 1.);
+    }
+}
+
+#[cfg(test)]
+mod normal_play_options_tests {
+    use super::Config;
+    #[test]
+    fn normal_audio_and_flow_options_persist_and_default_off() {
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.normal_preserve_pitch && !config.normal_note_flow_inverse);
+        config.normal_preserve_pitch = true;
+        config.normal_note_flow_inverse = true;
+        let decoded: Config = serde_json::from_slice(&serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(decoded.preserve_pitch_for(false));
+        assert!(decoded.note_flow_inverse_for(false, false));
+        // Normal settings do not enable the independent practice options.
+        assert!(!decoded.preserve_pitch_for(true));
+        assert!(!decoded.note_flow_inverse_for(true, false));
+        assert!(decoded.note_flow_inverse_for(true, true));
+    }
+}

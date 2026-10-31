@@ -1,0 +1,1000 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>chart.json → PEC 转换器</title>
+<style>
+    :root {
+        --bg: #101015;
+        --panel: #1a1a22;
+        --panel2: #22222c;
+        --line: #2e2e3a;
+        --text: #e6e6ee;
+        --dim: #8b8b9e;
+        --accent: #7fd3ff;
+        --ok: #6ee7a0;
+        --warn: #ffd479;
+        --err: #ff7b7b;
+    }
+
+    * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+        -webkit-tap-highlight-color: transparent;
+    }
+
+    html, body {
+        min-height: 100%;
+        background: var(--bg);
+        color: var(--text);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        font-size: 15px;
+        line-height: 1.6;
+    }
+
+    body {
+        padding: 16px;
+        padding-bottom: max(16px, env(safe-area-inset-bottom));
+        max-width: 860px;
+        margin: 0 auto;
+    }
+
+    h1 {
+        font-size: 19px;
+        font-weight: 600;
+        letter-spacing: .3px;
+        margin-bottom: 4px;
+    }
+
+    h1 small {
+        font-size: 12px;
+        color: var(--dim);
+        font-weight: 400;
+        margin-left: 8px;
+    }
+
+    .sub {
+        color: var(--dim);
+        font-size: 13px;
+        margin-bottom: 18px;
+        line-height: 1.5;
+    }
+
+    .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 14px;
+    }
+
+    .drop {
+        border: 2px dashed var(--line);
+        border-radius: 12px;
+        padding: 26px 16px;
+        text-align: center;
+        cursor: pointer;
+        transition: .18s;
+        user-select: none;
+    }
+
+    .drop:hover, .drop.over {
+        border-color: var(--accent);
+        background: rgba(127, 211, 255, .06);
+    }
+
+    .drop .big {
+        font-size: 15px;
+        margin-bottom: 4px;
+    }
+
+    .drop .small {
+        font-size: 12px;
+        color: var(--dim);
+    }
+
+    input[type=file] { display: none; }
+
+    .fileinfo {
+        margin-top: 12px;
+        font-size: 13px;
+        color: var(--dim);
+        word-break: break-all;
+    }
+
+    .fileinfo b { color: var(--text); font-weight: 500; }
+
+    .opts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 20px;
+        margin-top: 14px;
+    }
+
+    label.opt {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 13px;
+        cursor: pointer;
+        user-select: none;
+    }
+
+    label.opt input {
+        width: 16px;
+        height: 16px;
+        accent-color: var(--accent);
+        cursor: pointer;
+    }
+
+    button {
+        font: inherit;
+        font-size: 14px;
+        border: 1px solid var(--line);
+        background: var(--panel2);
+        color: var(--text);
+        border-radius: 9px;
+        padding: 10px 18px;
+        cursor: pointer;
+        transition: .15s;
+    }
+
+    button:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent);
+    }
+
+    button:disabled {
+        opacity: .4;
+        cursor: not-allowed;
+    }
+
+    button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #061018;
+        font-weight: 600;
+    }
+
+    button.primary:hover:not(:disabled) {
+        filter: brightness(1.1);
+        color: #061018;
+    }
+
+    .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 14px;
+    }
+
+    .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+        gap: 8px;
+        margin-top: 14px;
+    }
+
+    .stat {
+        background: var(--panel2);
+        border-radius: 9px;
+        padding: 9px 10px;
+    }
+
+    .stat .k {
+        font-size: 11px;
+        color: var(--dim);
+        letter-spacing: .4px;
+    }
+
+    .stat .v {
+        font-size: 17px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .msg {
+        margin-top: 12px;
+        font-size: 13px;
+        padding: 9px 12px;
+        border-radius: 9px;
+        display: none;
+        white-space: pre-wrap;
+        word-break: break-word;
+    }
+
+    .msg.show { display: block; }
+    .msg.ok { background: rgba(110, 231, 160, .1); color: var(--ok); }
+    .msg.err { background: rgba(255, 123, 123, .1); color: var(--err); }
+    .msg.warn { background: rgba(255, 212, 121, .1); color: var(--warn); }
+
+    .preview-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 10px;
+        flex-wrap: wrap;
+    }
+
+    .preview-head h2 {
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+    .tabs {
+        display: flex;
+        gap: 4px;
+        background: var(--panel2);
+        padding: 3px;
+        border-radius: 8px;
+    }
+
+    .tabs button {
+        padding: 5px 12px;
+        font-size: 12px;
+        border: none;
+        background: transparent;
+        border-radius: 6px;
+        color: var(--dim);
+    }
+
+    .tabs button.active {
+        background: var(--panel);
+        color: var(--text);
+    }
+
+    pre#preview {
+        background: #0b0b10;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        padding: 12px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.55;
+        color: #b9c4d4;
+        max-height: 46vh;
+        overflow: auto;
+        white-space: pre;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior: contain;
+    }
+
+    .foot {
+        font-size: 12px;
+        color: var(--dim);
+        line-height: 1.7;
+        margin-top: 8px;
+    }
+
+    .foot code {
+        background: var(--panel2);
+        padding: 1px 5px;
+        border-radius: 4px;
+        font-size: 11.5px;
+    }
+
+    /* ---- 打包区 ---- */
+    .packbox {
+        margin-top: 14px;
+        padding: 12px;
+        border-radius: 10px;
+        background: var(--panel2);
+        border: 1px dashed var(--line);
+    }
+
+    .packbox.ready {
+        border-color: rgba(110, 231, 160, .45);
+        border-style: solid;
+    }
+
+    .packbox .title {
+        font-size: 13px;
+        margin-bottom: 8px;
+        color: var(--text);
+    }
+
+    .packbox .title b {
+        color: var(--ok);
+    }
+
+    .packlist {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 12.5px;
+        color: var(--dim);
+        margin-bottom: 10px;
+    }
+
+    .packlist .row {
+        display: flex;
+        gap: 8px;
+        align-items: baseline;
+    }
+
+    .packlist .k {
+        width: 52px;
+        flex: none;
+        color: var(--dim);
+    }
+
+    .packlist .v {
+        color: var(--text);
+        word-break: break-all;
+    }
+
+    .packlist .v.miss {
+        color: var(--warn);
+    }
+</style>
+</head>
+<body>
+
+<h1>chart.json → PEC <small>Phira 格式</small></h1>
+<p class="sub">
+    把 Phigros 的 <b>chart.json</b> 转成 Phira 能直接加载的 <b>.pec</b>。<br>
+    也可以直接把含 <b>chart.json 的文件夹 / 压缩包</b> 拖进来。
+</p>
+
+<div class="panel">
+    <div class="drop" id="drop">
+        <div class="big">点这里选文件，或把文件拖进来</div>
+        <div class="small">什么文件都能选：.json / .zip / .pez（类型按文件内容自动判断）</div>
+    </div>
+    <!-- 不加 accept：手机 WebView 常把 accept 当硬过滤，导致选不到 .zip / .pez。
+         真实的类型判断在 JS 里做（看扩展名 + 读文件头），不靠这里。 -->
+    <input type="file" id="file" multiple>
+
+    <div class="fileinfo" id="fileinfo"></div>
+
+    <div class="opts">
+        <label class="opt"><input type="checkbox" id="optLines" checked> 导出判定线动效</label>
+        <label class="opt"><input type="checkbox" id="optSpeed" checked> 导出线速 cv</label>
+        <label class="opt"><input type="checkbox" id="optHold" checked> Hold 的 # 固定为 1</label>
+    </div>
+
+    <div class="actions">
+        <button class="primary" id="go" disabled>转换</button>
+        <button id="dl" disabled>下载 .pec</button>
+        <button id="copy" disabled>复制全文</button>
+        <button id="pack" disabled>打包成 .zip</button>
+    </div>
+
+    <div class="msg" id="msg"></div>
+
+    <div class="packbox" id="packbox" style="display:none">
+        <div class="title">压缩包内容：转换后 <b>替换谱面</b>，音乐 / 图片 / info 原样保留</div>
+        <div class="packlist" id="packlist"></div>
+        <div class="opts" style="margin-top:0">
+            <label class="opt"><input type="checkbox" id="optInfo" checked> 生成 info.yml（format: pec）</label>
+        </div>
+    </div>
+
+    <div class="stats" id="stats" style="display:none">
+        <div class="stat"><div class="k">判定线</div><div class="v" id="sLines">-</div></div>
+        <div class="stat"><div class="k">音符</div><div class="v" id="sNotes">-</div></div>
+        <div class="stat"><div class="k">Hold</div><div class="v" id="sHolds">-</div></div>
+        <div class="stat"><div class="k">线条指令</div><div class="v" id="sCmds">-</div></div>
+        <div class="stat"><div class="k">BPM</div><div class="v" id="sBpm">-</div></div>
+        <div class="stat"><div class="k">总行数</div><div class="v" id="sRows">-</div></div>
+    </div>
+</div>
+
+<div class="panel" id="panelPreview" style="display:none">
+    <div class="preview-head">
+        <h2>预览</h2>
+        <div class="tabs">
+            <button data-tab="head" class="active">开头</button>
+            <button data-tab="notes">音符段</button>
+            <button data-tab="tail">结尾</button>
+        </div>
+    </div>
+    <pre id="preview"></pre>
+</div>
+
+<p class="foot">
+    换算依据 Phira 的 <code>prpr/src/parse/pec.rs</code>：<br>
+    音符 x <code>×115.2</code> · 判定线 x <code>×2048</code> · y <code>×1400</code> ·
+    时间 <code>time/32</code> · 线速 <code>×5.85/0.83175</code> · offset <code>+0.15</code>
+</p>
+
+<script src="lib/jszip.min.js"></script>
+<script src="chart2pec.js"></script>
+<script>
+(function () {
+    "use strict";
+
+    var $ = function (id) { return document.getElementById(id); };
+
+    var dropEl = $("drop");
+    var fileEl = $("file");
+    var infoEl = $("fileinfo");
+    var msgEl = $("msg");
+    var goBtn = $("go");
+    var dlBtn = $("dl");
+    var copyBtn = $("copy");
+    var packBtn = $("pack");
+    var packBox = $("packbox");
+    var packList = $("packlist");
+    var previewEl = $("preview");
+    var panelPreview = $("panelPreview");
+
+    var state = {
+        chart: null,
+        chartName: "",
+        pecText: "",
+        pecName: "chart.pec",
+        preview: { head: "", notes: "", tail: "" },
+        tab: "head",
+
+        // ---- 打包用 ----
+        assets: null,        // { music: {name, blob}, image: {name, blob}, info: {name, text} }
+        canPack: false,      // 只有从压缩包来才允许原样打包
+        packZip: null        // 原始 zip（用于取音乐/图片的原始字节）
+    };
+
+    function say(text, kind) {
+        msgEl.textContent = text || "";
+        msgEl.className = "msg" + (text ? " show " + (kind || "") : "");
+    }
+
+    function readAsText(file) {
+        return new Promise(function (res, rej) {
+            var fr = new FileReader();
+            fr.onload = function () { res(String(fr.result)); };
+            fr.onerror = function () { rej(new Error("读取失败：" + file.name)); };
+            fr.readAsText(file, "utf-8");
+        });
+    }
+
+    function readAsArrayBuffer(file) {
+        return new Promise(function (res, rej) {
+            var fr = new FileReader();
+            fr.onload = function () { res(fr.result); };
+            fr.onerror = function () { rej(new Error("读取失败：" + file.name)); };
+            fr.readAsArrayBuffer(file);
+        });
+    }
+
+    function readHead(file, n) {
+        return new Promise(function (res) {
+            var fr = new FileReader();
+            fr.onload = function () {
+                res(new Uint8Array(fr.result).slice(0, n));
+            };
+            fr.onerror = function () { res(new Uint8Array(0)); };
+            fr.readAsArrayBuffer(file.slice(0, n));
+        });
+    }
+
+    function isChartObject(o) {
+        return o && Array.isArray(o.judgeLineList) && o.judgeLineList.length > 0
+            && o.judgeLineList[0] && Array.isArray(o.judgeLineList[0].speedEvents);
+    }
+
+    // 从一个 json 对象里找谱面：可能是 chart.json 本身，也可能包着
+    function pickChart(o) {
+        if (isChartObject(o)) return o;
+        // 有些导出是 { chart: {...} }
+        if (o && o.chart && isChartObject(o.chart)) return o.chart;
+        return null;
+    }
+
+    // ---- 从 zip 里挑音乐 / 图片 / info ----
+    // Phira 用 info.yml（优先）→ info.txt → info.csv，缺了会自己猜
+    var AUDIO_EXT = /\.(ogg|oga|mp3|m4a|aac|wav|flac|opus)$/i;
+    var IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)$/i;
+    // Phira 认的 info 文件，严格按优先级
+    var INFO_NAMES = ["info.yml", "info.yaml", "info.txt", "info.csv"];
+
+    function pickByName(entries, prefer, extRe) {
+        // 先找约定名，再找同扩展名
+        for (var i = 0; i < prefer.length; i++) {
+            for (var j = 0; j < entries.length; j++) {
+                if (baseNameOnly(entries[j]).toLowerCase() === prefer[i]) return entries[j];
+            }
+        }
+        for (var k = 0; k < entries.length; k++) {
+            if (extRe.test(entries[k])) return entries[k];
+        }
+        return null;
+    }
+
+    function baseNameOnly(p) {
+        return String(p).split("/").pop();
+    }
+
+    // 收集压缩包里除谱面外的资源
+    async function collectAssets(zip, chartEntry) {
+        var entries = Object.keys(zip.files).filter(function (n) {
+            return !zip.files[n].dir;
+        });
+
+        var musicPath = pickByName(entries, ["music.ogg", "music.mp3", "song.ogg", "song.mp3", "audio.ogg"], AUDIO_EXT);
+        var imagePath = pickByName(entries, ["image.png", "image.jpg", "background.png", "background.jpg", "illustration.png"], IMAGE_EXT);
+        var infoPath = null;
+        // 严格按 Phira 的优先级：info.yml > info.yaml > info.txt > info.csv
+        for (var i = 0; i < INFO_NAMES.length; i++) {
+            for (var j = 0; j < entries.length; j++) {
+                if (baseNameOnly(entries[j]).toLowerCase() === INFO_NAMES[i]) { infoPath = entries[j]; break; }
+            }
+            if (infoPath) break;
+        }
+        // info.json 只在没有任何其他 info 时兜底（它不是 Phira 认的格式，只用来取字段）
+        if (!infoPath) {
+            for (var k = 0; k < entries.length; k++) {
+                if (baseNameOnly(entries[k]).toLowerCase() === "info.json") { infoPath = entries[k]; break; }
+            }
+        }
+
+        // 读 info 原文（保留用户原有字段）
+        var infoText = null;
+        if (infoPath) {
+            try { infoText = await zip.files[infoPath].async("string"); } catch (e) { infoText = null; }
+        }
+
+        // 音乐 / 图片：只记路径，打包时再取字节
+        return {
+            musicPath: musicPath,
+            imagePath: imagePath,
+            infoPath: infoPath,
+            infoText: infoText,
+            chartEntry: chartEntry,
+            entries: entries
+        };
+    }
+
+    // 简易 YAML 读取：只处理顶层 key: value（够 info.yml 用）
+    // 也兼容 info.json（Phira 不认它，但压缩包里常见，用来继承字段）
+    function parseSimpleYaml(text) {
+        var out = {};
+        if (!text) return out;
+
+        var s = String(text).replace(/^\uFEFF/, "").trim();
+
+        // JSON 直接当对象
+        if (s.charAt(0) === "{") {
+            try {
+                var o = JSON.parse(s);
+                if (o && typeof o === "object") return o;
+            } catch (e) { /* 不是合法 JSON，继续当 YAML */ }
+        }
+
+        s.split(/\r?\n/).forEach(function (line) {
+            if (!line.trim() || /^\s*#/.test(line)) return;
+            if (/^\s/.test(line)) return;              // 跳过嵌套
+            var m = line.match(/^([A-Za-z_][\w]*)\s*:\s*(.*)$/);
+            if (!m) return;
+            var v = m[2].trim();
+            if (v === "null" || v === "~") { out[m[1]] = null; return; }
+            if (/^".*"$/.test(v) || /^'.*'$/.test(v)) v = v.slice(1, -1);
+            if (/^-?\d+(\.\d+)?$/.test(v)) v = Number(v);
+            else if (v === "true") v = true;
+            else if (v === "false") v = false;
+            out[m[1]] = v;
+        });
+        return out;
+    }
+
+    function yamlQuote(s) {
+        return '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+    }
+
+    // 生成 info.yml：保留原字段，改 chart / music / illustration / format
+    function buildInfoYaml(originalText, opts) {
+        var old = parseSimpleYaml(originalText);
+        var base = baseNameOnly(opts.chartFile).replace(/\.(json|pec|rpe|pbc)$/i, "") || "chart";
+
+        var info = {
+            name: old.name || base,
+            difficulty: old.difficulty != null ? old.difficulty : 10.0,
+            level: old.level || "SP Lv.1",
+            charter: old.charter || "",
+            composer: old.composer || "",
+            illustrator: old.illustrator || "",
+            chart: opts.chartFile,
+            format: "pec",
+            music: opts.musicFile,
+            illustration: opts.imageFile,
+            unlockVideo: old.unlockVideo != null ? old.unlockVideo : null,
+            previewStart: old.previewStart != null ? old.previewStart : 0.0,
+            previewEnd: old.previewEnd != null ? old.previewEnd : 20.0,
+            aspectRatio: old.aspectRatio != null ? old.aspectRatio : 1.7777778,
+            backgroundDim: old.backgroundDim != null ? old.backgroundDim : 0.6,
+            lineLength: old.lineLength != null ? old.lineLength : 6.0,
+            offset: old.offset != null ? old.offset : 0.0,
+            tip: old.tip != null ? old.tip : null,
+            tags: Array.isArray(old.tags) ? old.tags : [],
+            intro: old.intro || "",
+            holdPartialCover: old.holdPartialCover === true
+        };
+
+        var lines = [];
+        lines.push("name: " + yamlQuote(info.name));
+        lines.push("difficulty: " + info.difficulty);
+        lines.push("level: " + yamlQuote(info.level));
+        lines.push("charter: " + yamlQuote(info.charter));
+        lines.push("composer: " + yamlQuote(info.composer));
+        lines.push("illustrator: " + yamlQuote(info.illustrator));
+        lines.push("chart: " + yamlQuote(info.chart));
+        lines.push("format: " + info.format);
+        lines.push("music: " + yamlQuote(info.music));
+        lines.push("illustration: " + yamlQuote(info.illustration));
+        lines.push("unlockVideo: " + (info.unlockVideo == null ? "null" : yamlQuote(info.unlockVideo)));
+        lines.push("previewStart: " + info.previewStart);
+        lines.push("previewEnd: " + info.previewEnd);
+        lines.push("aspectRatio: " + info.aspectRatio);
+        lines.push("backgroundDim: " + info.backgroundDim);
+        lines.push("lineLength: " + info.lineLength);
+        lines.push("offset: " + info.offset);
+        lines.push("tip: " + (info.tip == null ? "null" : yamlQuote(info.tip)));
+        lines.push("tags: [" + info.tags.map(yamlQuote).join(", ") + "]");
+        lines.push("intro: " + yamlQuote(info.intro));
+        lines.push("holdPartialCover: " + info.holdPartialCover);
+        return lines.join("\n") + "\n";
+    }
+
+    async function handleFiles(files) {
+        if (!files || !files.length) return;
+
+        say("正在读取…");
+        goBtn.disabled = true;
+        dlBtn.disabled = true;
+        copyBtn.disabled = true;
+        state.chart = null;
+        state.pecText = "";
+        panelPreview.style.display = "none";
+        $("stats").style.display = "none";
+
+        var names = [];
+        var chart = null;
+
+        try {
+            for (var i = 0; i < files.length; i++) {
+                var file = files[i];
+                names.push(file.name);
+
+                // 类型判断不靠 accept / MIME（手机上 .pez 常被识别成 octet-stream）：
+                // 读前 4 个字节看是不是 zip 头 "PK\x03\x04"
+                var head = await readHead(file, 4);
+                var isZip = head[0] === 0x50 && head[1] === 0x4b
+                    && (head[2] === 0x03 || head[2] === 0x05 || head[2] === 0x07);
+
+                // ---- zip / pez ----
+                if (isZip) {
+                    if (typeof JSZip === "undefined") {
+                        throw new Error("压缩包需要 jszip，但没加载成功（检查 lib/jszip.min.js）");
+                    }
+                    var zip = await JSZip.loadAsync(await readAsArrayBuffer(file));
+                    var entries = Object.keys(zip.files).filter(function (n) {
+                        return !zip.files[n].dir && /\.json$/i.test(n);
+                    });
+                    // 优先 chart.json
+                    entries.sort(function (a, b) {
+                        var an = a.split("/").pop().toLowerCase(), bn = b.split("/").pop().toLowerCase();
+                        return (an === "chart.json" ? 0 : 1) - (bn === "chart.json" ? 0 : 1);
+                    });
+                    for (var e = 0; e < entries.length; e++) {
+                        try {
+                            var obj = JSON.parse(await zip.files[entries[e]].async("string"));
+                            var found = pickChart(obj);
+                            if (found) {
+                                chart = found;
+                                state.chartName = entries[e];
+                                // 记下原始 zip，用于打包时取音乐/图片的字节
+                                state.packZip = zip;
+                                state.chartEntry = entries[e];
+                                break;
+                            }
+                        } catch (err) { /* 跳过不是 json 的 */ }
+                    }
+                    if (!chart) throw new Error("压缩包里找不到 chart.json（或含 judgeLineList 的 json）");
+                    break;
+                }
+
+                // ---- json（同样看内容，不看扩展名）----
+                {
+                    var text = await readAsText(file);
+                    var o;
+                    try {
+                        o = JSON.parse(text);
+                    } catch (err2) {
+                        names[names.length - 1] += "（不是 JSON）";
+                        continue;
+                    }
+                    var c = pickChart(o);
+                    if (c) {
+                        chart = c;
+                        state.chartName = file.name;
+                        break;
+                    }
+                    names[names.length - 1] += "（没有 judgeLineList）";
+                    continue;
+                }
+            }
+
+            if (!chart) {
+                throw new Error("没找到谱面。需要含 judgeLineList 的 chart.json。\n文件：" + names.join("、"));
+            }
+
+            state.chart = chart;
+
+            var lines = chart.judgeLineList;
+            var noteCount = 0;
+            lines.forEach(function (l) {
+                noteCount += (l.notes || []).length
+                    + (l.notesAbove || []).length
+                    + (l.notesBelow || []).length;
+            });
+
+            infoEl.innerHTML = "已载入 <b>" + escapeHtml(state.chartName) + "</b>　"
+                + lines.length + " 条判定线　" + noteCount + " 个音符";
+
+            // ---- 如果是压缩包，收集音乐 / 图片 / info，准备打包 ----
+            state.assets = null;
+            state.canPack = false;
+
+            if (state.packZip) {
+                try {
+                    var assets = await collectAssets(state.packZip, state.chartEntry);
+                    state.assets = assets;
+                    state.canPack = !!(assets.musicPath || assets.imagePath);
+
+                    var rows = [];
+                    function row(k, v, miss) {
+                        rows.push('<div class="row"><span class="k">' + k + '</span>'
+                            + '<span class="v' + (miss ? " miss" : "") + '">' + escapeHtml(v) + "</span></div>");
+                    }
+                    row("谱面", state.chartEntry, false);
+                    row("音乐", assets.musicPath || "未找到", !assets.musicPath);
+                    row("图片", assets.imagePath || "未找到", !assets.imagePath);
+                    row("info", assets.infoPath || "无（将新建 info.yml）", !assets.infoPath);
+
+                    packList.innerHTML = rows.join("");
+                    packBox.style.display = "block";
+                    packBox.className = "packbox" + (state.canPack ? " ready" : "");
+                } catch (e) {
+                    console.warn("收集资源失败", e);
+                    packBox.style.display = "none";
+                }
+            } else {
+                packBox.style.display = "none";
+            }
+
+            goBtn.disabled = false;
+            packBtn.disabled = true;
+            say("谱面读取成功，点「转换」生成 PEC。", "ok");
+        } catch (err) {
+            console.error(err);
+            infoEl.innerHTML = "";
+            say("出错：" + (err && err.message ? err.message : err), "err");
+        }
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+        });
+    }
+
+    function baseName(s) {
+        return String(s).split("/").pop().replace(/\.(json|zip|pez)$/i, "");
+    }
+
+    function doConvert() {
+        if (!state.chart) return;
+
+        say("转换中…");
+        goBtn.disabled = true;
+
+        // 让出主线程，好让「转换中…」显示出来
+        setTimeout(function () {
+            try {
+                var t0 = performance.now();
+                var result = Chart2PEC.convert(state.chart, {
+                    withLines: $("optLines").checked,
+                    withSpeed: $("optSpeed").checked,
+                    holdSpeedOne: $("optHold").checked
+                });
+                var ms = Math.round(performance.now() - t0);
+
+                state.pecText = result.text;
+                state.pecName = (baseName(state.chartName) || "chart") + ".pec";
+
+                var st = result.stats;
+                $("sLines").textContent = st.lines;
+                $("sNotes").textContent = st.notes;
+                $("sHolds").textContent = st.holds;
+                $("sCmds").textContent = st.lineCommands;
+                $("sBpm").textContent = st.bpm;
+                $("sRows").textContent = result.text.split("\n").length - 1;
+                $("stats").style.display = "grid";
+
+                // 预览分段
+                var arr = result.text.split("\n");
+                var firstNote = arr.findIndex(function (l) { return /^n[1-4]\s/.test(l); });
+                if (firstNote < 0) firstNote = arr.length;
+
+                state.preview.head = arr.slice(0, Math.min(24, arr.length)).join("\n");
+                state.preview.notes = arr.slice(firstNote, firstNote + 24).join("\n");
+                state.preview.tail = arr.slice(Math.max(0, arr.length - 25)).join("\n");
+                state.tab = "head";
+
+                var tabs = document.querySelectorAll(".tabs button");
+                for (var i = 0; i < tabs.length; i++) {
+                    tabs[i].className = tabs[i].dataset.tab === "head" ? "active" : "";
+                }
+
+                previewEl.textContent = state.preview.head;
+                panelPreview.style.display = "block";
+
+                dlBtn.disabled = false;
+                copyBtn.disabled = false;
+                packBtn.disabled = !state.canPack;
+                goBtn.disabled = false;
+
+                say("转换完成：" + st.notes + " 音符、" + st.lineCommands + " 条线条指令，用了 "
+                    + ms + "ms。", "ok");
+            } catch (err) {
+                console.error(err);
+                goBtn.disabled = false;
+                say("转换失败：" + (err && err.message ? err.message : err), "err");
+            }
+        }, 20);
+    }
+
+    document.querySelectorAll(".tabs button").forEach(function (btn) {
+        btn.onclick = function () {
+            state.tab = btn.dataset.tab;
+            document.querySelectorAll(".tabs button").forEach(function (b) {
+                b.className = b.dataset.tab === state.tab ? "active" : "";
+            });
+            previewEl.textContent = state.preview[state.tab] || "";
+            previewEl.scrollTop = 0;
+        };
+    });
+
+    goBtn.onclick = doConvert;
+
+    dlBtn.onclick = function () {
+        if (!state.pecText) return;
+        var blob = new Blob(["\ufeff" + state.pecText], { type: "text/plain;charset=utf-8" });
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = state.pecName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+        say("已下载 " + state.pecName, "ok");
+    };
+
+    copyBtn.onclick = async function () {
+        if (!state.pecText) return;
+        try {
+            await navigator.clipboard.writeText(state.pecText);
+            say("已复制到剪贴板。", "ok");
+        } catch (e) {
+            // 老浏览器兜底
+            var ta = document.createElement("textarea");
+            ta.value = state.pecText;
+            ta.style.position = "fixed";
+            ta.style.opacity = "0";
+            document.body.appendChild(ta);
+            ta.select();
+            try {
+                document.execCommand("copy");
+                say("已复制到剪贴板。", "ok");
+            } catch (e2) {
+                say("复制失败，请手动选择预览区文本。", "warn");
+            }
+            document.body.removeChild(ta);
+        }
+    };
+
+    // ---- 打包成 zip ----
+    packBtn.onclick = async function () {
+        if (!state.pecText || !state.assets) return;
+
+        packBtn.disabled = true;
+        say("正在打包…");
+
+        try {
+            var out = new JSZip();
+            var a = state.assets;
+
+            // 1) 谱面：转好的 PEC，命名跟原 json 同名只换扩展名
+            var chartFileName = baseName(state.chartEntry || "chart.json") + ".pec";
+            out.file(chartFileName, state.pecText);
+
+            // 2) 音乐 / 图片：原样拷贝字节
+            var musicName = null, imageName = null;
+
+            if (a.musicPath) {
+                musicName = baseNameOnly(a.musicPath);
+                var mb = await state.packZip.files[a.musicPath].async("uint8array");
+                out.file(musicName, mb);
+            }
+            if (a.imagePath) {
+                imageName = baseNameOnly(a.imagePath);
+                var ib = await state.packZip.files[a.imagePath].async("uint8array");
+                out.file(imageName, ib);
+            }
+
+            // 3) info.yml：改 chart / music / illustration / format
+            if ($("optInfo").checked) {
+                var yml = buildInfoYaml(a.infoText, {
+                    chartFile: chartFileName,
+                    musicFile: musicName || "music.ogg",
+                    imageFile: imageName || "image.png"
+                });
+                out.file("info.yml", yml);
+            }
+
+            var blob = await out.generateAsync({
+                type: "blob",
+                compression: "DEFLATE",
+                compressionOptions: { level: 6 }
+            });
+
+            var zipName = (baseName(state.chartName) || "chart") + "_pec.zip";
+            var url = URL.createObjectURL(blob);
+            var link = document.createElement("a");
+            link.href = url;
+            link.download = zipName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+
+            var sizeMB = (blob.size / 1048576).toFixed(2);
+            say("已打包 " + zipName + "（" + sizeMB + " MB）\n"
+                + "包含：" + [chartFileName, musicName, imageName, "info.yml"].filter(Boolean).join("、"), "ok");
+        } catch (err) {
+            console.error(err);
+            say("打包失败：" + (err && err.message ? err.message : err), "err");
+        } finally {
+            packBtn.disabled = false;
+        }
+    };
+
+    // ---- 拖拽 ----
+    dropEl.onclick = function () { fileEl.click(); };
+
+    fileEl.onchange = function () {
+        handleFiles(fileEl.files);
+        fileEl.value = "";
+    };
+
+    ["dragenter", "dragover"].forEach(function (ev) {
+        dropEl.addEventListener(ev, function (e) {
+            e.preventDefault();
+            dropEl.classList.add("over");
+        });
+    });
+
+    ["dragleave", "drop"].forEach(function (ev) {
+        dropEl.addEventListener(ev, function (e) {
+            e.preventDefault();
+            dropEl.classList.remove("over");
+        });
+    });
+
+    dropEl.addEventListener("drop", function (e) {
+        e.preventDefault();
+        if (e.dataTransfer && e.dataTransfer.files.length) {
+            handleFiles(e.dataTransfer.files);
+        }
+    });
+
+    // 拖到页面别处也别让浏览器打开文件
+    window.addEventListener("dragover", function (e) { e.preventDefault(); });
+    window.addEventListener("drop", function (e) { e.preventDefault(); });
+})();
+</script>
+</body>
+</html>
