@@ -628,24 +628,305 @@ const clip_hold = (img, atlas) => {
     return [head, body, tail];
 };
 
+// ============================================================
+// 音乐播放：优先 Web Audio（时长/时间可控），失败回退 <audio>
+//   某些环境下 <audio>.duration 会变成 Infinity，导致 currentTime 永远不走、
+//   谱面卡死。Web Audio 用 decodeAudioData 拿到真实 PCM，时间和时长都精确。
+// ============================================================
+const music_player = {
+    buffer: null,
+    source: null,
+    gain: null,
+    fallback_el: null,
+    started_at: 0,
+    offset: 0,
+    playing: false,
+    ready: false,
+    duration: 0
+};
+
+function music_stop() {
+    if (music_player.source) {
+        try { music_player.source.stop(); } catch (e) { /* 忽略 */ }
+        try { music_player.source.disconnect(); } catch (e) { /* 忽略 */ }
+        music_player.source = null;
+    }
+
+    music_player.playing = false;
+}
+
+function music_play() {
+    if (!music_player.ready) return Promise.resolve();
+
+    music_stop();
+
+    const src = actx.createBufferSource();
+
+    src.buffer = music_player.buffer;
+    src.connect(music_player.gain);
+
+    music_player.started_at = actx.currentTime;
+    music_player.source = src;
+    music_player.playing = true;
+
+    src.start(0, Math.min(music_player.offset, music_player.duration));
+
+    src.onended = () => {
+        if (music_player.source === src) {
+            music_player.playing = false;
+            music_player.offset = music_player.duration;
+        }
+    };
+
+    if (actx.state === "suspended") actx.resume().catch(() => {});
+
+    return Promise.resolve();
+}
+
+function music_pause() {
+    if (!music_player.playing) return;
+
+    music_player.offset = music_current_time();
+    music_stop();
+}
+
+function music_current_time() {
+    if (music_player.ready) {
+        if (!music_player.playing) return music_player.offset;
+
+        const t = music_player.offset + (actx.currentTime - music_player.started_at);
+
+        return Math.max(0, Math.min(music_player.duration, t));
+    }
+
+    return music_player.fallback_el ? music_player.fallback_el.currentTime : 0;
+}
+
+function music_seek(sec) {
+    const target = Math.max(0, Math.min(music_player.duration || 0, sec));
+
+    music_player.offset = target;
+
+    if (music_player.playing) {
+        music_stop();
+        music_play();
+    }
+}
+
+// 兼容层：对外表现成「一个 audio 元素」
+const music_shim = {
+    get currentTime() { return music_current_time(); },
+    set currentTime(v) {
+        if (music_player.ready) {
+            music_seek(v);
+            return;
+        }
+
+        if (music_player.fallback_el) {
+            try { music_player.fallback_el.currentTime = v; } catch (e) { /* 忽略 */ }
+        }
+    },
+    get duration() {
+        if (music_player.ready) return music_player.duration;
+
+        return music_player.fallback_el ? music_player.fallback_el.duration : 0;
+    },
+    get paused() {
+        if (music_player.ready) return !music_player.playing;
+
+        return music_player.fallback_el ? music_player.fallback_el.paused : true;
+    },
+    get muted() { return music_player.fallback_el ? music_player.fallback_el.muted : false; },
+    get volume() { return music_player.fallback_el ? music_player.fallback_el.volume : 1; },
+    get readyState() { return music_player.fallback_el ? music_player.fallback_el.readyState : 4; },
+    get networkState() { return music_player.fallback_el ? music_player.fallback_el.networkState : 1; },
+    get buffered() { return music_player.fallback_el ? music_player.fallback_el.buffered : { length: 0 }; },
+    get parentNode() { return null; },
+
+    play() {
+        if (music_player.ready) return music_play();
+
+        return music_player.fallback_el ? music_player.fallback_el.play() : Promise.resolve();
+    },
+    pause() {
+        if (music_player.ready) {
+            music_pause();
+            return;
+        }
+
+        if (music_player.fallback_el) music_player.fallback_el.pause();
+    },
+    remove() {
+        music_stop();
+
+        if (music_player.fallback_el?.parentNode) {
+            music_player.fallback_el.remove();
+        }
+
+        music_player.fallback_el = null;
+    },
+    style: {},
+    addEventListener() {},
+    removeEventListener() {}
+};
+
+// 加载音乐：先试 Web Audio 解码（时长精确），失败再回退 <audio>
+const load_music = async (url, onProgress) => {
+    music_stop();
+    music_player.ready = false;
+    music_player.buffer = null;
+    music_player.offset = 0;
+    music_player.duration = 0;
+
+    try {
+        const bin = await load_bin(url, onProgress);
+
+        // decodeAudioData 会消耗掉 ArrayBuffer，先复制一份给兜底解析用
+        const copy = bin.slice(0);
+
+        const buffer = await new Promise((resolve, reject) => {
+            // 兼容老式回调签名
+            const p = actx.decodeAudioData(bin, resolve, reject);
+
+            if (p && typeof p.then === "function") p.then(resolve, reject);
+        });
+
+        music_player.buffer = buffer;
+        music_player.duration = buffer.duration;
+        music_player.ready = true;
+
+        if (!music_player.gain) {
+            music_player.gain = actx.createGain();
+            music_player.gain.connect(actx.destination);
+        }
+
+        console.log("[音乐] Web Audio 解码成功，时长 =", buffer.duration, "秒");
+
+        if (onProgress) onProgress(1);
+
+        return music_shim;
+    } catch (e) {
+        console.warn("[音乐] Web Audio 解码失败，回退 <audio>：", e && e.message);
+    }
+
+    // ---- 回退：原来的 <audio> 路径 ----
+    const el = await load_audioele(url, onProgress);
+
+    music_player.fallback_el = el;
+
+    return music_shim;
+};
 const load_audioele = async (url, onProgress) => {
     const audio = new Audio();
     audio.preload = "auto";
 
     await new Promise((resolve, reject) => {
+        let settled = false;
+
+        const cleanup = () => {
+            audio.onprogress = null;
+            audio.onloadeddata = null;
+            audio.onloadedmetadata = null;
+            audio.oncanplaythrough = null;
+            audio.ondurationchange = null;
+            audio.onerror = null;
+        };
+
+        const finish = () => {
+            if (settled) return;
+
+            settled = true;
+
+            cleanup();
+
+            // 【重要】以前这里用 currentTime = 1e101 去「逼」浏览器算出 duration。
+            // 那个技巧会把媒体元素 seek 到末尾，导致 readyState 卡在 HAVE_METADATA(1)，
+            // play() 拉不起来、currentTime 永远不走。
+            // 现在只把播放位置归零，不碰 load()，避免把已加载的数据重置掉。
+            try {
+                audio.currentTime = 0;
+            } catch (e) {
+                // 忽略
+            }
+
+            if (onProgress) onProgress(1);
+
+            resolve();
+        };
+
+        // 时长兜底：浏览器给 Infinity / NaN 时，自己从 ogg 字节里算
+        const fix_duration = async () => {
+            if (Number.isFinite(audio.duration) && audio.duration > 0) return audio.duration;
+
+            try {
+                const resp = await fetch(audio.src, { cache: "force-cache" });
+                const buf = await resp.arrayBuffer();
+                const dur = ogg_duration_from_buffer(buf);
+
+                if (dur > 0) {
+                    console.log("[音频] 浏览器给出 duration =", audio.duration, "，已用 ogg 解析兜底 =", dur);
+                    return dur;
+                }
+            } catch (e) {
+                console.warn("[音频] 兜底解析失败：", e);
+            }
+
+            return 0;
+        };
+
         audio.onprogress = () => {
             if (onProgress && Number.isFinite(audio.duration) && audio.duration > 0 && audio.buffered.length > 0) {
                 onProgress(Math.min(0.99, audio.buffered.end(audio.buffered.length - 1) / audio.duration));
             }
         };
-        audio.onloadeddata = () => {
-            if (onProgress) onProgress(1);
-            resolve();
+
+        // metadata 阶段就能拿到 duration，比 loadeddata 更早且更可靠
+        // 【关键】优先等到 canplay（readyState >= 3，数据真的可播），
+        //   只在 metadata 阶段就 resolve 会导致 readyState 停在 1、play() 拉不起来。
+        audio.onloadedmetadata = () => {
+            // 只记录时长，不在这里结束
+            if (Number.isFinite(audio.duration) && audio.duration > 0) {
+                console.log("[音频] metadata 就绪，duration =", audio.duration, " readyState =", audio.readyState);
+            }
         };
+
+        audio.onloadeddata = () => {
+            console.log("[音频] loadeddata, readyState =", audio.readyState);
+
+            if (audio.readyState >= 2) finish();
+        };
+
+        audio.oncanplay = () => {
+            console.log("[音频] canplay, readyState =", audio.readyState);
+            finish();
+        };
+
+        audio.oncanplaythrough = () => {
+            console.log("[音频] canplaythrough, readyState =", audio.readyState);
+            finish();
+        };
+
+        audio.ondurationchange = () => {
+            if (Number.isFinite(audio.duration) && audio.duration > 0) {
+                console.log("[音频] duration 就绪 =", audio.duration);
+            }
+        };
+
         audio.onerror = () => reject(new Error(`${url} 加载失败（音频）`));
+
         audio.src = url;
         audio.load();
+
+        // 兜底：8 秒还没就绪就继续（总比卡住好）
+        setTimeout(finish, 8000);
     });
+
+    // 时长兜底（浏览器给 Infinity 时自己算）
+    audio.__fallbackDuration = await fix_duration();
+
+    if (audio.__fallbackDuration > 0) {
+        console.log("[音频] 最终时长基准 =", audio.__fallbackDuration);
+    }
 
     return audio;
 };
@@ -990,6 +1271,153 @@ const hud_total = () => {
 };
 
 // ---- 暂停（左上角按钮，随时可点）----
+// 从 Ogg Vorbis 文件字节里解析真实时长（浏览器有时给 Infinity）
+const ogg_duration_from_buffer = (buffer) => {
+    try {
+        const b = new Uint8Array(buffer);
+        let off = 0, lastGran = 0, rate = 0;
+
+        while (off < b.length - 27) {
+            // 'OggS'
+            if (!(b[off] === 0x4f && b[off + 1] === 0x67 && b[off + 2] === 0x67 && b[off + 3] === 0x53)) {
+                off++;
+                continue;
+            }
+
+            // granule position 是 little-endian uint64，位于 offset+6
+            const lo = b[off + 6] | (b[off + 7] << 8) | (b[off + 8] << 16) | (b[off + 9] << 24);
+            const hi = b[off + 10] | (b[off + 11] << 8) | (b[off + 12] << 16) | (b[off + 13] << 24);
+
+            // 0xFFFFFFFFFFFFFFFF 表示「本页没有完整 packet」
+            const isEnd = (lo === -1 && hi === -1);
+
+            if (rate === 0) {
+                // 第一页里找 "\x01vorbis"，sample rate 在 +12
+                const key = [0x01, 0x76, 0x6f, 0x72, 0x62, 0x69, 0x73];
+                let found = -1;
+
+                for (let i = off; i < Math.min(off + 200, b.length - 16); i++) {
+                    let ok = true;
+
+                    for (let k = 0; k < key.length; k++) {
+                        if (b[i + k] !== key[k]) { ok = false; break; }
+                    }
+
+                    if (ok) { found = i; break; }
+                }
+
+                if (found > 0) {
+                    rate = (b[found + 12] | (b[found + 13] << 8) | (b[found + 14] << 16) | (b[found + 15] << 24)) >>> 0;
+                }
+            }
+
+            if (!isEnd) {
+                lastGran = hi * 4294967296 + (lo >>> 0);
+            }
+
+            off += 27;
+        }
+
+        if (rate > 0 && lastGran > 0) {
+            const dur = lastGran / rate;
+
+            if (Number.isFinite(dur) && dur > 0) return dur;
+        }
+    } catch (e) {
+        console.warn("[音频] 解析 ogg 时长失败：", e);
+    }
+
+    return 0;
+};
+
+const audio_duration = () => {
+    const m = C.chart?.music;
+
+    if (!m) return 0;
+
+    const d = m.duration;
+
+    if (Number.isFinite(d) && d > 0) return d;
+
+    // 退化 1：加载时从 ogg 字节算出的时长
+    if (Number.isFinite(m.__fallbackDuration) && m.__fallbackDuration > 0) {
+        return m.__fallbackDuration;
+    }
+
+    // 退化 2：用 buffered 末尾兜底
+    try {
+        if (m.buffered && m.buffered.length > 0) {
+            const end = m.buffered.end(m.buffered.length - 1);
+
+            if (Number.isFinite(end) && end > 0) return end;
+        }
+    } catch (e) {
+        // 忽略
+    }
+
+    return 0;
+};
+
+// 把画面 x 换算成播放时间并 seek
+let seek_dur_warned = false;
+
+// 按秒 seek
+const seek_to_seconds = (sec) => {
+    if (!C.chart?.music) return false;
+
+    // 没在游玩时不允许 seek：音频还没 play()，设 currentTime 会被浏览器丢弃
+    if (!running) {
+        if (seek_label) seek_label.textContent = "进度：先点「开始游戏」再拖动";
+        return false;
+    }
+
+    const dur = audio_duration();
+
+    if (!(dur > 0)) {
+        if (!seek_dur_warned) {
+            seek_dur_warned = true;
+            console.warn(
+                "[进度] 拿不到音频时长，无法 seek。duration =",
+                C.chart.music.duration,
+                " readyState =", C.chart.music.readyState,
+                " buffered =", C.chart.music.buffered ? C.chart.music.buffered.length : "无"
+            );
+        }
+
+        return false;
+    }
+
+    const target = Math.max(0, Math.min(dur, sec));
+
+    try {
+        C.chart.music.currentTime = target;
+    } catch (e) {
+        console.warn("[进度] seek 失败", e);
+        return false;
+    }
+
+    // 跳转后清掉判定残留
+    hud_combo = 0;
+    last_judge = null;
+
+    // 若当前走的是内部时钟，跳转后要同步基准
+    if (render._fallbackWarned) {
+        render._fallbackBase = target;
+        render._fallbackStart = performance.now();
+    }
+
+    // 暂停中拖动 → 自动继续播放，否则画面会冻在目标时间点看起来像卡住
+    if (paused) {
+        set_paused(false);
+    } else if (C.chart.music.paused) {
+        if (actx.state === "suspended") actx.resume().catch(() => {});
+
+        C.chart.music.play().catch(e => console.warn("[进度] 继续播放失败", e));
+    }
+
+    return true;
+};
+
 let paused = false;
 let running = false;   // 是否正在游玩（返回主界面后置 false，渲染循环随之停止）
 
@@ -1137,8 +1565,95 @@ const start_play = () => {
     running = true;
     lastFrameTime = performance.now();
 
-    C.chart.music.play().catch(e => console.warn("音乐播放失败", e));
+    // 重置内部时钟降级状态
+    render._fallbackWarned = false;
+    render._fallbackBase = 0;
+    render._fallbackStart = 0;
+    render._stallCount = 0;
+    render._lastMusicT = undefined;
+
+    const music = C.chart?.music;
+
+    if (music) {
+        // 从 0 开始
+        try { music.currentTime = 0; } catch (e) { /* 忽略 */ }
+
+        const do_play = () => {
+            console.log("[播放] 尝试播放，readyState =", music.readyState);
+
+            const p = music.play();
+
+            if (p && typeof p.catch === "function") {
+                p.then(() => {
+                    console.log("[播放] 音乐已开始, duration =", music.duration, " readyState =", music.readyState);
+                }).catch(e => {
+                    console.error(
+                        "[播放] 音乐播放被拒绝：", e && e.name, e && e.message,
+                        "\n  readyState =", music.readyState, " networkState =", music.networkState,
+                        "\n  可能是自动播放限制，或音频解不了码。"
+                    );
+                });
+            }
+        };
+
+        // readyState < 2（还没到 HAVE_CURRENT_DATA）→ 先等 canplay
+        if (music.readyState < 2) {
+            console.warn("[播放] 音频尚未就绪(readyState=" + music.readyState + ")，等待 canplay…");
+
+            let started = false;
+
+            const on_ready = () => {
+                if (started) return;
+
+                started = true;
+
+                music.removeEventListener("canplay", on_ready);
+                music.removeEventListener("canplaythrough", on_ready);
+                music.removeEventListener("loadeddata", on_ready);
+
+                console.log("[播放] canplay 触发，readyState =", music.readyState);
+                do_play();
+            };
+
+            music.addEventListener("canplay", on_ready);
+            music.addEventListener("canplaythrough", on_ready);
+            music.addEventListener("loadeddata", on_ready);
+
+            // 主动催一下加载
+            try {
+                music.load();
+            } catch (e) { /* 忽略 */ }
+
+            // 3 秒还没就绪也硬播一次
+            setTimeout(() => {
+                if (!started) {
+                    started = true;
+                    console.warn("[播放] 等待超时，强制播放");
+                    do_play();
+                }
+            }, 3000);
+        } else {
+            do_play();
+        }
+    } else {
+        console.warn("[播放] C.chart.music 不存在");
+    }
+
     render();
+
+    // 开播后 1 秒自检：currentTime 还是 0 就说明没真正播放
+    setTimeout(() => {
+        if (!running || !music) return;
+
+        if (music.currentTime < 0.05 && music.paused) {
+            console.error(
+                "[播放] 音乐没有推进（currentTime =", music.currentTime,
+                " paused =", music.paused,
+                " readyState =", music.readyState,
+                " networkState =", music.networkState, "）"
+            );
+        }
+    }, 1000);
 };
 
 // 返回主界面：停渲染循环 + 复位判定，回到开始界面（谱面资源留着，可以直接再开）
@@ -1197,7 +1712,7 @@ const render_hud = (ctx, w, h) => {
     const autoplay_size = h * 0.028;          // AUTOPLAY 字号
     const autoplay_y = combo_y + combo_size + h * 0.006;   // AUTOPLAY：紧贴 COMBO 下方
 
-    const dur = C.chart.music.duration || 0;
+    const dur = audio_duration();
     const progress = dur > 0 ? Math.max(0, Math.min(1, C.chart.music.currentTime / dur)) : 0;
     const score = Math.min(1000000, Math.round(hud_score * 1000000 / hud_total()));
 
@@ -1310,6 +1825,90 @@ if (autoplay_btn) {
 
 set_autoplay(autoplay);
 
+// ---- 设置面板里的进度条 ----
+const seek_slider = document.querySelector("#seek-slider");
+const seek_label = document.querySelector("#seek-label");
+
+const fmt_time = (s) => {
+    if (!Number.isFinite(s) || s < 0) s = 0;
+
+    const m = Math.floor(s / 60);
+    const sec = Math.floor(s % 60);
+
+    return m + ":" + String(sec).padStart(2, "0");
+};
+
+let seeking = false;   // 正在拖滑块时不回写，避免打架
+
+if (seek_slider) {
+    // 拖动中：实时 seek
+    seek_slider.addEventListener("input", () => {
+        const dur = audio_duration();
+
+        if (!(dur > 0)) return;
+
+        const ratio = Number(seek_slider.value) / 1000;
+        const ok = seek_to_seconds(ratio * dur);
+
+        if (ok) {
+            seeking = true;
+
+            if (seek_label) {
+                seek_label.textContent = "进度 " + fmt_time(ratio * dur) + " / " + fmt_time(dur);
+            }
+        } else {
+            // seek 没成功（多半是还没开始游戏），把滑块拉回实际位置
+            seeking = false;
+            sync_seek_slider();
+        }
+    });
+
+    const end_seek = () => {
+        seeking = false;
+    };
+
+    seek_slider.addEventListener("change", end_seek);
+    seek_slider.addEventListener("pointerup", end_seek);
+    seek_slider.addEventListener("pointercancel", end_seek);
+
+    // 由音乐时间驱动：每 200ms 把 currentTime 同步到滑块
+    function sync_seek_slider() {
+        if (seeking) return;
+
+        const dur = audio_duration();
+        const cur = C.chart?.music?.currentTime ?? 0;
+
+        if (!running) {
+            if (seek_label) seek_label.textContent = "进度：先点「开始游戏」再拖动";
+
+            seek_slider.value = "0";
+
+            return;
+        }
+
+        if (dur > 0) {
+            const ratio = Math.max(0, Math.min(1, cur / dur));
+
+            seek_slider.value = String(Math.round(ratio * 1000));
+
+            if (seek_label) {
+                seek_label.textContent = "进度 " + fmt_time(cur) + " / " + fmt_time(dur);
+            }
+        } else if (seek_label) {
+            seek_label.textContent = "进度 — / —（音频时长未知）";
+        }
+    }
+
+    // 每 200ms 同步一次（只在面板可见时）
+    setInterval(() => {
+        if (offset_panel_el && offset_panel_el.classList.contains("hidden")) return;
+
+        sync_seek_slider();
+    }, 200);
+
+    sync_seek_slider();
+}
+
 // BAD 最多能提前多少（Tap 专属）：再早的点击直接忽略，不会去吃掉那个音符
 const JUDGE_BAD_EARLY = 0.25;
 
@@ -1421,6 +2020,35 @@ const PHIRA_NOTE_TAG = {
     [2]: "n4",   // Drag  ← 黄键，PEC 里是 n4
     [3]: "n2",   // Hold
     [4]: "n3"    // Flick ← 红键，PEC 里是 n3
+};
+
+// ============================================================
+// 判断谱面格式：官方 v3（formatVersion:3）还是 RPE（RPEVersion + eventLayers）
+//   两者结构完全不同：
+//     官方 v3：judgeLineList[i].speedEvents / notesAbove / notesBelow
+//     RPE    ：judgeLineList[i].eventLayers[].moveXEvents / notes
+//   不能只看第一条判定线（RPE 首条线常是空占位），要看整体结构。
+// ============================================================
+const detect_chart_format = (obj) => {
+    if (!obj || typeof obj !== "object") return null;
+    if (!Array.isArray(obj.judgeLineList)) return null;
+
+    const lines = obj.judgeLineList.filter(l => l && typeof l === "object");
+
+    // 【关键】结构判断优先于版本号：
+    //   官方 v3 绝不会出现 eventLayers；
+    //   而某些 RPE 导出工具会顺带写上 formatVersion: 3，只看版本号会误判。
+    const has_event_layers = lines.some(l => Array.isArray(l.eventLayers));
+    const has_official_events = lines.some(l => Array.isArray(l.speedEvents) || Array.isArray(l.notesAbove) || Array.isArray(l.notesBelow));
+
+    if (has_event_layers) return "rpe";
+    if (has_official_events) return "official";
+
+    // 结构看不出来时，才用版本号兜底
+    if (obj.RPEVersion !== undefined || Array.isArray(obj.BPMList)) return "rpe";
+    if (obj.formatVersion === 3) return "official";
+
+    return null;
 };
 
 // 判断一条判定线是不是「背面」（notesBelow）
@@ -2004,12 +2632,139 @@ let fps_frames = 0;
 let fps_last = performance.now();
 let noise_ms = 0;   // 噪域渲染耗时（平滑值），用来判断瓶颈在不在噪域
 
+// ============================================================
+// RPE 运行时渲染
+//   几何全部来自 rpe-next 的 LineRuntime.frame()，
+//   这里只负责把算好的坐标画出来。
+// ============================================================
+const render_rpe_frame = (ctx, t, w, h) => {
+    const frame = C.rpe.frame(t, w, h);
+
+    if (!frame || !frame.lines) return;
+
+    for (const item of frame.lines) {
+        const st = item.state;
+
+        // 判定线
+        if (st.alpha > 0.01) {
+            const half = h * C.lineh;
+            const dx = Math.cos(item.rotation) * half;
+            const dy = Math.sin(item.rotation) * half;
+
+            ctx.drawLine(
+                item.screenX - dx, item.screenY - dy,
+                item.screenX + dx, item.screenY + dy,
+                h * C.linew,
+                "rgba(" + C.pcolor.join(", ") + ", " + st.alpha + ")"
+            );
+        }
+
+        // 音符
+        for (const n of item.notes) {
+            const note_w = w * 0.1234375 * (n.size || 1);
+            const img_pair = C.note_head_imgs[n.note.type];
+
+            // Hold：从头部往尾部画一条
+            if (n.isHold) {
+                ctx.save();
+                ctx.globalAlpha = n.alpha;
+                ctx.strokeStyle = "rgba(" + C.pcolor.join(", ") + ", 0.85)";
+                ctx.lineWidth = Math.max(2, note_w * 0.55);
+                ctx.lineCap = "round";
+                ctx.beginPath();
+                ctx.moveTo(n.screenX, n.screenY);
+                ctx.lineTo(n.tailX, n.tailY);
+                ctx.stroke();
+                ctx.restore();
+            }
+
+            if (n.showHead !== false && img_pair) {
+                const img = img_pair[0];
+                const size = note_w;
+
+                ctx.save();
+                ctx.globalAlpha = n.alpha;
+                ctx.translate(n.screenX, n.screenY);
+                ctx.rotate(item.rotation + Math.PI / 2);
+                ctx.drawImage(img, -size / 2, -size / 2, size, size);
+                ctx.restore();
+            }
+        }
+    }
+};
+
 const render = () => {
     if (!running) return;      // 已返回主界面 → 停止渲染循环
 
     resize_canvas();
 
-    const t = C.chart.music.currentTime - (C.chart.data.offset + offset_ms / 1000);
+    // ---- 【自动降级】音乐不推进时，用内部时钟驱动画面 ----
+    //   某些环境 play() 会 resolve 但音频时间不走（duration = Infinity / WebView 限制），
+    //   这时谱面会卡死。检测到就切到 fallback 时钟，保证画面能动。
+    if (!paused && C.chart?.music) {
+        const mt = C.chart.music.currentTime;
+        const dur = C.chart.music.duration;
+
+        // duration = Infinity 是硬伤：浏览器根本不知道范围，currentTime 永远不会走
+        const broken_duration = !Number.isFinite(dur);
+
+        if (broken_duration && !render._fallbackWarned) {
+            render._fallbackWarned = true;
+            render._fallbackBase = 0;
+            render._fallbackStart = performance.now();
+
+            console.error(
+                "[播放] 音频 duration 无效（" + dur + "），立刻切内部时钟。\n" +
+                "  已用 ogg 解析得到的时长 =", audio_duration(),
+                "\n  → 谱面会正常跑，声音可能没有。"
+            );
+        }
+
+        if (!render._fallbackWarned) {
+            if (render._lastMusicT === undefined) render._lastMusicT = mt;
+
+            const stalled = Math.abs(mt - render._lastMusicT) < 0.0005;
+
+            render._lastMusicT = mt;
+
+            if (stalled) {
+                render._stallCount = (render._stallCount || 0) + 1;
+
+                if (render._stallCount > 30) {
+                    render._fallbackWarned = true;
+                    render._fallbackBase = mt;
+                    render._fallbackStart = performance.now();
+
+                    console.error(
+                        "[播放] 音频时间不推进，已切换到内部时钟驱动画面。\n" +
+                        "  currentTime =", mt,
+                        " paused =", C.chart.music.paused,
+                        " readyState =", C.chart.music.readyState
+                    );
+                }
+            } else {
+                render._stallCount = 0;
+            }
+        }
+    }
+
+    const t = ((render._fallbackWarned && !paused)
+        ? render._fallbackBase + (performance.now() - render._fallbackStart) / 1000
+        : C.chart.music.currentTime) - (C.chart.data.offset + offset_ms / 1000);
+
+    // 【诊断】每 1 秒打一次播放状态
+    if (!render._dbgT || performance.now() - render._dbgT > 1000) {
+        render._dbgT = performance.now();
+        console.log(
+            "[帧] currentTime =", C.chart.music.currentTime.toFixed(3),
+            " t =", t.toFixed(3),
+            " paused =", C.chart.music.paused,
+            " muted =", C.chart.music.muted,
+            " volume =", C.chart.music.volume,
+            " readyState =", C.chart.music.readyState,
+            render._fallbackWarned ? " [内部时钟]" : ""
+        );
+    }
 
     const [sw, sh] = [cv.width, cv.height];
 
@@ -2032,7 +2787,7 @@ const render = () => {
     ctx.drawImage(C.chart.image, 0, 0, w, h);
     ctx.fillRectEx(0, 0, w, h, "rgba(0, 0, 0, 0.6)");
 
-    // ----- noise-area update & render -----
+    // ----- noise-area update（只更新状态，绘制挪到 HUD 之后）-----
     {
         const now = performance.now();
         const dt = Math.max(0, (now - lastFrameTime) / 1000);
@@ -2043,10 +2798,13 @@ const render = () => {
 
         // 暂停时不推进噪域模拟（dt 传 0），画面完全冻结
         noiseState.update(noiseAreas, touches, t, w, h, ox, oy, noiseEnabled, paused ? 0 : dt);
-        renderBlockAreas(ctx, noiseAreas, t, w, h, ox, oy);
     }
     // ---------------------------------------
 
+    // ===== RPE 运行时渲染：判定线与音符的几何全部来自 rpe-next =====
+    if (C.rpe && C.chart.data?.__rpe_runtime) {
+        render_rpe_frame(ctx, t, w, h);
+    } else
     for (const line of C.chart.data.judgeLineList) {
         let [ lineRotate, lineX, lineY, lineAlpha ] = line.get_state(t);
         lineX *= w; lineY *= h;
@@ -2272,6 +3030,10 @@ const render = () => {
 
     render_hud(ctx, w, h);
 
+    // ----- 噪域绘制：放在 HUD 之后，盖住分数/连击，但仍在 16:9 画面内 -----
+    //   （不扩到全屏，所以背景模糊那层完全不受影响）
+    renderBlockAreas(ctx, noiseAreas, t, w, h, ox, oy);
+
     ctx.restore();
 
     // ---- 帧率显示（调试用：不想要就删掉这几行）----
@@ -2435,25 +3197,146 @@ const read_text = file => new Promise((resolve, reject) => {
 const try_parse_pec_or_rpe = text => {
     const P = window.PEC2JSON;
     const src = String(text ?? "").replace(/^\uFEFF/, "").trimStart();
+
     if (!src) return null;
 
-    if (!P) {
-        console.warn("[导入] 未加载 PEC/RPE 转换器（lib/pec2json.js 已移除），无法导入 .pec / .rpe");
-        return null;
-    }
+    // 注意：不能因为 P 不存在就整体放弃 —— 原生 RPE 解析器（js/rpe_chart.js）不依赖 P
+    const has_native = !!window.RpeChart;
 
-    // RPE：JSON，带 RPEVersion / BPMList / judgeLineList[i].eventLayers
+    // JSON：先判断是官方 v3 还是 RPE
     if (src.startsWith("{")) {
+        let o;
+
         try {
-            const o = JSON.parse(src);
-            if (o && (o.RPEVersion || o.BPMList) && Array.isArray(o.judgeLineList)) {
+            o = JSON.parse(src);
+        } catch (e) {
+            console.warn("[导入] JSON 解析失败：", e.message);
+            return null;
+        }
+
+        const fmt = detect_chart_format(o);
+
+        if (fmt === "rpe") {
+            // 【首选】rpe-next 运行时：解析 + 几何全用原版
+            if (window.RpeRuntime) {
+                try {
+                    console.log("[导入] RPE 运行时编译…  RPEVersion =", o.RPEVersion);
+
+                    const rt = window.RpeRuntime.compile(o);
+
+                    // 保留 import_info 供上层取名字/难度
+                    const meta = o.META || {};
+
+                    return {
+                        __rpe_runtime: rt,
+                        formatVersion: 3,
+                        offset: (Number(meta.offset) || 0) / 1000,
+                        judgeLineList: [],         // 运行时模式下不走这条路
+                        __from_rpe: true,
+                        __import_info: {
+                            Name: meta.name,
+                            Artist: meta.composer,
+                            Charter: meta.charter,
+                            Level: meta.level,
+                            Music: meta.song,
+                            Image: meta.background
+                        },
+                        __import_warnings: []
+                    };
+                } catch (e) {
+                    console.error("[导入] RPE 运行时编译失败：", e && e.message, "\n", e && e.stack);
+                }
+            } else {
+                console.warn("[导入] js/rpe_runtime.mjs 未加载，回退");
+            }
+
+            // 次选：内置的 js/rpe_chart.js
+            if (window.RpeChart) {
+                try {
+                    console.log("[导入] RPE 内置解析…");
+
+                    const chart = window.RpeChart.parse(o);
+                    const total = chart.judgeLineList.reduce(
+                        (s, l) => s + (l.notesAbove?.length || 0) + (l.notesBelow?.length || 0), 0
+                    );
+
+                    console.log(
+                        "[导入] RPE 内置解析完成：判定线", chart.judgeLineList.length,
+                        "条，音符", total
+                    );
+
+                    if (chart.judgeLineList.length) return chart;
+                } catch (e) {
+                    console.error("[导入] 内置 RPE 解析失败：", e && e.message);
+                }
+            }
+
+            // 回退：旧转换器（转成官方 v3）
+            if (!P) {
+                console.warn("[导入] 原生解析失败，且 lib/pec2json.js 未加载，无法回退");
+                return null;
+            }
+
+            try {
+                console.log("[导入] 用旧转换器解析 RPE…");
                 const r = P.parseRPE(src, "import.rpe");
                 const chart = JSON.parse(r.data);
+
                 chart.__import_warnings = r.messages ?? [];
                 chart.__import_info = r.info ?? null;
+
+                console.log(
+                    "[导入] RPE 转换完成：判定线", chart.judgeLineList?.length,
+                    "条，音符", chart.numOfNotes ?? "?"
+                );
+
+                if (!Array.isArray(chart.judgeLineList) || !chart.judgeLineList.length) {
+                    console.warn("[导入] RPE 转换后没有判定线");
+                    return null;
+                }
+
                 return chart;
+            } catch (e) {
+                console.error("[导入] RPE 转换失败：", e && e.message, "\n", e && e.stack);
+                return null;
             }
-        } catch (e) {}
+        }
+
+        if (fmt === "official") {
+            console.log("[导入] 识别为官方 v3 格式（formatVersion 3）");
+
+            // 结构校验：官方 v3 的判定线必须至少有 speedEvents / notesAbove 之一
+            const bad = o.judgeLineList.findIndex(l =>
+                !l || (!Array.isArray(l.speedEvents) && !Array.isArray(l.notesAbove) && !Array.isArray(l.notesBelow))
+            );
+
+            if (bad >= 0) {
+                console.error(
+                    "[导入] 第 " + bad + " 条判定线缺少 speedEvents / notesAbove，",
+                    "字段：", o.judgeLineList[bad] ? Object.keys(o.judgeLineList[bad]).join(",") : "null"
+                );
+                console.warn("[导入] 该谱面可能是 RPE 变体，尝试用 RPE 解析器再试一次");
+
+                if (window.RpeChart) {
+                    try {
+                        const chart = window.RpeChart.parse(o);
+
+                        if (chart.judgeLineList.length) {
+                            console.log("[导入] RPE 解析器成功接管：判定线", chart.judgeLineList.length);
+                            return chart;
+                        }
+                    } catch (e) {
+                        console.error("[导入] RPE 兜底解析也失败：", e && e.message);
+                    }
+                }
+
+                return null;
+            }
+
+            return o;
+        }
+
+        console.warn("[导入] 无法识别的 JSON 结构，顶层字段：", Object.keys(o).join(", "));
         return null;
     }
 
@@ -2556,25 +3439,31 @@ const import_from_files = async files => {
             }
 
             if (obj && Array.isArray(obj.judgeLineList)) {
-                if (obj.judgeLineList.length && obj.judgeLineList[0].eventLayers) {
-                    // RPE 格式：交给转换器转成 Phigros chart
+                const fmt = detect_chart_format(obj);
+
+                if (fmt === "rpe") {
+                    // RPE 格式：交给转换器转成官方 v3
                     const rpe_chart = chart ? null : try_parse_pec_or_rpe(raw);
+
                     if (rpe_chart) {
                         chart = rpe_chart;
                         chart_file = file;
                         continue;
                     }
-                }
 
-                if (!chart) {
-                    chart = obj;
-                    chart_file = file;
+                    console.warn("[导入] RPE 谱面转换失败，已跳过", file.name);
+                } else if (fmt === "official") {
+                    if (!chart) {
+                        chart = obj;
+                        chart_file = file;
+                    }
+                } else {
+                    // 不是谱面 → 当 info.json 用
+                    const i = parse_info(JSON.stringify(obj), true);
+
+                    if (!info.name && i.name) info.name = i.name;
+                    if (!info.level && i.level) info.level = i.level;
                 }
-            } else {
-                // 不是谱面 → 当 info.json 用
-                const i = parse_info(JSON.stringify(obj), true);
-                if (!info.name && i.name) info.name = i.name;
-                if (!info.level && i.level) info.level = i.level;
             }
         } else if (kind === "text") {
             // 先试着当 .pec / RPE 谱面（Phira 谱面通常是纯文本 .pec）
@@ -2741,10 +3630,10 @@ set_chart_status();
 const load_game = async () => {
     resize_canvas();
 
-    // 重新加载时（例如换了导入的谱面）先清掉上一次的音乐元素，避免叠加
-    if (C.chart.music?.parentNode) {
+    // 重新加载时（例如换了导入的谱面）先清掉上一次的音乐，避免叠加
+    if (C.chart.music) {
         try { C.chart.music.pause(); } catch (e) {}
-        C.chart.music.remove();
+        try { C.chart.music.remove(); } catch (e) {}
     }
 
     C.click_sounds[C.note.tap] = await step(onProgress => load_audio("res/click.ogg", onProgress), "正在加载点击音效...");
@@ -2772,14 +3661,25 @@ const load_game = async () => {
         C.chart.info = imported_chart.info;
         C.chart.data = imported_chart.chart;
         set_progress("正在初始化导入的谱面...");
-        noiseAreas = parseBlockAreasFromChart(C.chart.data);
-        C.chart.music = await step(() => load_audioele(imported_chart.music_url), "正在加载谱面音乐...");
-        C.chart.image = get_blur_img(await step(() => load_img(imported_chart.image_url)), "正在加载曲绘...");
+
+        // RPE 运行时模式：几何由 rpe-next 的 LineRuntime 负责，不走官方 v3 的 init
+        if (C.chart.data?.__rpe_runtime) {
+            C.rpe = C.chart.data.__rpe_runtime;
+            noiseAreas = [];
+            console.log("[加载] RPE 运行时模式，音符", C.rpe.noteCount, "个");
+            hud_total_notes = C.rpe.noteCount || 1;
+            C.chart.music = await step(() => load_music(imported_chart.music_url), "正在加载谱面音乐...");
+            C.chart.image = get_blur_img(await step(() => load_img(imported_chart.image_url), "正在加载曲绘..."), 0.05);
+        } else {
+            noiseAreas = parseBlockAreasFromChart(C.chart.data);
+            C.chart.music = await step(() => load_music(imported_chart.music_url), "正在加载谱面音乐...");
+            C.chart.image = get_blur_img(await step(() => load_img(imported_chart.image_url), "正在加载曲绘..."), 0.05);
+        }
     } else {
         C.chart.info = await step(onProgress => load_json("res/chart/info.json", onProgress), "正在读取谱面信息...");
         C.chart.data = await step(onProgress => load_json("res/chart/chart.json", onProgress), "正在下载谱面 chart.json...");
         noiseAreas = parseBlockAreasFromChart(C.chart.data);
-        C.chart.music = await step(onProgress => load_audioele("res/chart/music.ogg", onProgress), "正在加载谱面音乐...");
+        C.chart.music = await step(onProgress => load_music("res/chart/music.ogg", onProgress), "正在加载谱面音乐...");
         C.chart.image = get_blur_img(await step(() => load_img("res/chart/image.png"), "正在加载曲绘..."), 0.05);
     }
 
@@ -2801,8 +3701,11 @@ const load_game = async () => {
 
     C.hit_fx_imgs = build_hit_fx_imgs(C.pcolor);
 
-    C.chart.music.style.display = "none";
-    document.body.appendChild(C.chart.music);
+    // Web Audio 模式下 music_shim 不在 DOM 里，只有回退的 <audio> 需要挂载
+    if (music_player.fallback_el) {
+        music_player.fallback_el.style.display = "none";
+        document.body.appendChild(music_player.fallback_el);
+    }
 
     await step(onProgress => apply_font(font_index, onProgress), "正在加载字体...");
 
@@ -2810,7 +3713,16 @@ const load_game = async () => {
 
     const note_sect_counter = new Map();
 
-    for (const line of C.chart.data.judgeLineList) {
+    // RPE 运行时模式：判定线/音符几何由 rpe-next 负责，这里跳过官方 v3 的初始化
+    const rpe_runtime_mode = !!C.chart.data.__rpe_runtime;
+
+    for (const line of (rpe_runtime_mode ? [] : C.chart.data.judgeLineList)) {
+        // 防呆：导入的谱面可能缺少某些事件数组（RPE 空线 / 残缺谱面）
+        line.speedEvents = Array.isArray(line.speedEvents) ? line.speedEvents : [];
+        line.judgeLineRotateEvents = Array.isArray(line.judgeLineRotateEvents) ? line.judgeLineRotateEvents : [];
+        line.judgeLineMoveEvents = Array.isArray(line.judgeLineMoveEvents) ? line.judgeLineMoveEvents : [];
+        line.judgeLineDisappearEvents = Array.isArray(line.judgeLineDisappearEvents) ? line.judgeLineDisappearEvents : [];
+
         line.speedEvents.sort((a, b) => a.startTime - b.startTime);
         line.judgeLineRotateEvents.sort((a, b) => a.startTime - b.startTime);
         line.judgeLineMoveEvents.sort((a, b) => a.startTime - b.startTime);
@@ -2925,6 +3837,13 @@ window.onload = () => {
         if (text) {
             text.style.color = "#ff5566";
             text.textContent = "加载失败：" + (e && e.message ? e.message : e);
+            console.error("[加载失败] 完整堆栈：\n", e && e.stack ? e.stack : e);
+            console.error("[加载失败] 谱面结构：", C.chart?.data ? {
+                formatVersion: C.chart.data.formatVersion,
+                来自RPE: C.chart.data.__from_rpe,
+                判定线数: C.chart.data.judgeLineList?.length,
+                第0线字段: C.chart.data.judgeLineList?.[0] ? Object.keys(C.chart.data.judgeLineList[0]).join(",") : "无"
+            } : "无谱面");
         }
     });
 };

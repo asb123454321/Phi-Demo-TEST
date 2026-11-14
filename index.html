@@ -280,6 +280,76 @@
         .hidden {
             display: none !important;
         }
+        /* ---- 伪全屏（浏览器不支持原生全屏时使用）---- */
+        html.fake-fullscreen,
+        body.fake-fullscreen {
+            margin: 0 !important;
+            padding: 0 !important;
+            width: 100vw !important;
+            height: 100vh !important;
+            max-width: none !important;
+            max-height: none !important;
+            overflow: hidden !important;
+            background: #000 !important;
+        }
+
+        html.fake-fullscreen canvas#main-canvas,
+        body.fake-fullscreen canvas#main-canvas {
+            width: 100vw !important;
+            height: 100vh !important;
+            display: block !important;
+        }
+
+        /* 伪全屏时把界面上的滚动条藏掉，观感更接近真全屏 */
+        html.fake-fullscreen::-webkit-scrollbar,
+        body.fake-fullscreen::-webkit-scrollbar {
+            display: none;
+        }
+        /* ---- 面板内的进度条 ---- */
+        #seek-row {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            padding: 2px 0 4px;
+        }
+
+        #seek-label {
+            font-size: 12px;
+            color: #ffd700;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+
+        #seek-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 6px;
+            border-radius: 3px;
+            background: rgba(255, 255, 255, 0.22);
+            outline: none;
+            cursor: pointer;
+        }
+
+        #seek-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #fff;
+            border: 2px solid #ff5566;
+            cursor: pointer;
+        }
+
+        #seek-slider::-moz-range-thumb {
+            width: 14px;
+            height: 14px;
+            border-radius: 50%;
+            background: #fff;
+            border: 2px solid #ff5566;
+            cursor: pointer;
+        }
     </style>
 </head>
 <body>
@@ -376,6 +446,13 @@
             <button data-font="2">濑户</button>
             <button data-font="3">汉仪粗</button>
         </div>
+        <div id="seek-row">
+            <div id="seek-label">进度 0:00 / 0:00</div>
+            <input id="seek-slider" type="range" min="0" max="1000" value="0" step="1">
+        </div>
+        <div class="offset-row">
+            <button id="screen-mode-toggle">全屏横屏：关</button>
+        </div>
         <div id="export-hint">导出打击记录</div>
         <div class="offset-row">
             <button id="export-judged">已判定</button>
@@ -388,9 +465,246 @@
 
     <input type="file" id="file-input" class="hidden">
 
-    <script src="js/noise_shader.js"></script>
+    <script src="js/rpe_noise/noise-skin-padding.js"></script>
+    <script src="js/rpe_noise/noise-skin-compat.js"></script>
+    <script src="js/rpe_noise/noise-skin.js"></script>
+    <script src="js/rpe_noise/noise-skin-renderer.js"></script>
+    <script src="js/rpe_noise/adapter.js"></script>
     <script src="js/noise_render.js"></script>
     <script src="lib/jszip.min.js"></script>
+    <script src="lib/pec2json.js"></script>
+    <script src="js/rpe_chart.js"></script>
+    <script type="module" src="js/rpe_runtime.mjs"></script>
     <script src="main.js"></script>
+
+    <script>
+    // ============================================================
+    // 自动横屏 + 全屏
+    //   只在 index.html 里实现，不改 main.js。
+    //   浏览器要求全屏必须由用户手势触发，所以：
+    //     - 按钮点击 → 直接进入全屏 + 锁横屏
+    //     - 页面加载 → 只更新按钮文案（无法自动全屏）
+    // ============================================================
+    (function () {
+        "use strict";
+
+        var KEY = "phigros_screen_mode";
+        var btn = null;
+        var fake_on = false;   // 伪全屏状态（环境不支持原生全屏时使用）
+
+        function is_fullscreen() {
+            if (fake_on) return true;
+
+            return !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement);
+        }
+
+        function is_landscape() {
+            if (screen.orientation && typeof screen.orientation.type === "string") {
+                return screen.orientation.type.indexOf("landscape") === 0;
+            }
+
+            return window.innerWidth > window.innerHeight;
+        }
+
+        function update_label() {
+            if (!btn) btn = document.querySelector("#screen-mode-toggle");
+            if (!btn) return;
+
+            var on = is_fullscreen();
+
+            btn.textContent = "全屏横屏：" + (on ? "开" : "关");
+        }
+
+        function lock_landscape() {
+            var so = screen.orientation;
+
+            if (!so || typeof so.lock !== "function") return Promise.resolve(false);
+
+            return so.lock("landscape").then(function () {
+                return true;
+            }).catch(function (e) {
+                // 桌面浏览器 / iOS Safari 通常不支持锁定，忽略即可
+                console.warn("[横屏] 锁定失败（不影响全屏）：", e && e.name);
+                return false;
+            });
+        }
+
+        function enter() {
+            var el = document.documentElement;
+            var req = el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen || el.msRequestFullscreen;
+
+            console.log("[全屏] 调用全屏，req =", typeof req);
+
+            if (!req) {
+                console.warn("[全屏] 当前浏览器不支持全屏 API，改用伪全屏");
+                fake_fullscreen(true);
+                return;
+            }
+
+            var result;
+
+            try {
+                result = req.call(el, { navigationUI: "hide" });
+            } catch (e) {
+                console.error("[全屏] 调用抛异常：", e && e.name, e && e.message, "→ 改用伪全屏");
+                fake_fullscreen(true);
+                return;
+            }
+
+            if (result && typeof result.then === "function") {
+                result.then(function () {
+                    console.log("[全屏] 进入成功，fullscreenElement =", document.fullscreenElement && document.fullscreenElement.tagName);
+                    fake_fullscreen(false);
+                    return lock_landscape();
+                }).catch(function (e) {
+                    console.error("[全屏] 进入失败：", e && e.name, e && e.message, "→ 改用伪全屏");
+                    fake_fullscreen(true);
+                });
+            } else {
+                lock_landscape();
+            }
+        }
+
+        // ---------- 伪全屏：环境不支持全屏 API 时的降级 ----------
+        //   把页面铺满视口、滚到顶部、并尝试锁横屏。
+        //   不能真正隐藏浏览器 UI，但至少能把画面铺满。
+        function fake_fullscreen(on) {
+            if (on === fake_on) return;
+
+            fake_on = on;
+
+            var html = document.documentElement;
+            var body = document.body;
+
+            if (on) {
+                html.classList.add("fake-fullscreen");
+                if (body) body.classList.add("fake-fullscreen");
+
+                window.scrollTo(0, 0);
+                lock_landscape();
+                console.log("[全屏] 已进入伪全屏（浏览器不支持原生全屏）");
+            } else {
+                html.classList.remove("fake-fullscreen");
+                if (body) body.classList.remove("fake-fullscreen");
+            }
+
+            // 画布尺寸变了，触发一次 resize 让主循环重新计算
+            window.dispatchEvent(new Event("resize"));
+            update_label();
+        }
+
+        function exit() {
+            if (fake_on) {
+                fake_fullscreen(false);
+                return;
+            }
+
+            var fn = document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen || document.msExitFullscreen;
+
+            if (fn) {
+                var r = fn.call(document);
+
+                if (r && typeof r.catch === "function") r.catch(function () {});
+            }
+
+            if (screen.orientation && typeof screen.orientation.unlock === "function") {
+                try { screen.orientation.unlock(); } catch (e) { /* 忽略 */ }
+            }
+        }
+
+        function toggle() {
+            console.log("[横屏] toggle，当前全屏 =", is_fullscreen(), " 当前横屏 =", is_landscape());
+
+            if (is_fullscreen()) {
+                exit();
+                try { localStorage.setItem(KEY, "0"); } catch (e) { /* 忽略 */ }
+            } else {
+                enter();
+                try { localStorage.setItem(KEY, "1"); } catch (e) { /* 忽略 */ }
+            }
+
+            setTimeout(update_label, 150);
+        }
+
+        function init() {
+            btn = document.querySelector("#screen-mode-toggle");
+
+            var inFrame = window.top !== window.self;
+
+            console.log(
+                "[横屏] init\n" +
+                "  按钮找到 = " + !!btn + "\n" +
+                "  requestFullscreen = " + typeof document.documentElement.requestFullscreen + "\n" +
+                "  webkitRequestFullscreen = " + typeof document.documentElement.webkitRequestFullscreen + "\n" +
+                "  在 iframe 内 = " + inFrame + "\n" +
+                "  fullscreenEnabled = " + document.fullscreenEnabled + "\n" +
+                "  orientation.lock = " + (screen.orientation ? typeof screen.orientation.lock : "无 orientation") + "\n" +
+                "  屏幕 = " + window.innerWidth + "x" + window.innerHeight
+            );
+
+            if (inFrame && document.fullscreenEnabled === false) {
+                console.warn(
+                    "[横屏] 当前页面在 iframe 里且没有 fullscreen 权限。\n" +
+                    "需要 iframe 带 allow=\"fullscreen\" 属性，或直接在浏览器里打开 index.html 测试。"
+                );
+            }
+
+            if (btn) {
+                btn.addEventListener("click", function (ev) {
+                    console.log("[横屏] 按钮被点击");
+                    ev.stopPropagation();
+                    ev.preventDefault();
+                    toggle();
+                });
+
+                btn.addEventListener("pointerdown", function (ev) {
+                    ev.stopPropagation();
+                }, true);
+            } else {
+                console.error("[横屏] 找不到 #screen-mode-toggle 按钮");
+            }
+
+            // 全屏状态变化时同步按钮文案
+            ["fullscreenchange", "webkitfullscreenchange", "mozfullscreenchange", "MSFullscreenChange"].forEach(function (name) {
+                document.addEventListener(name, function () {
+                    update_label();
+
+                    // 进入全屏后尝试锁横屏（有些浏览器允许在 change 后锁）
+                    if (is_fullscreen()) lock_landscape();
+                });
+            });
+
+            // 屏幕旋转时也刷新
+            window.addEventListener("orientationchange", update_label);
+            window.addEventListener("resize", update_label);
+
+            update_label();
+
+            // 上次用过全屏横屏的话，提示用户在任意点击时自动进入
+            var wanted = null;
+
+            try { wanted = localStorage.getItem(KEY); } catch (e) { /* 忽略 */ }
+
+            if (wanted === "1") {
+                var arm = function () {
+                    document.removeEventListener("pointerdown", arm, true);
+                    document.removeEventListener("touchstart", arm, true);
+
+                    if (!is_fullscreen()) enter();
+                };
+
+                document.addEventListener("pointerdown", arm, true);
+                document.addEventListener("touchstart", arm, true);
+            }
+        }
+
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", init);
+        } else {
+            init();
+        }
+    })();
+    </script>
+
 </body>
 </html>
