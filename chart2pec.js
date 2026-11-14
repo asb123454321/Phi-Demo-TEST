@@ -2,9 +2,9 @@
  * chart2pec.js —— Phigros chart.json → Phira PEC
  *
  * 全部系数严格对齐 Phira 的 Rust 解析器：
- *   Phira/prpr/src/parse/pec.rs
- *   Phira/prpr/src/parse/pgr.rs
- *   Phira/prpr/src/core.rs
+ *   PhiraiAd-1.5.2/prpr/src/parse/pec.rs
+ *   PhiraiAd-1.5.2/prpr/src/parse/pgr.rs
+ *   PhiraiAd-1.5.2/prpr/src/core.rs
  *
  * 用法：
  *   Chart2PEC.convert(chartObj, { withLines: true })  → 字符串
