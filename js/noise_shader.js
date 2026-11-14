@@ -16,6 +16,10 @@
 // 参数名与 assets/materials.json 对齐，方便逐条核对。
 // ============================================================
 
+// 【自证】文件开始执行就立刻打标记。若本文件 404 或语法错误，这个标记不会出现，
+// 排查时一眼就能区分「没加载到」和「加载了但函数没定义」。
+window.__noise_shader_loaded = true;
+
 const NOISE_SHADER = {
     scale: 4,            // 内部分辨率 = 画面 / scale（越大越快、越糊）【性能】原 3
     fieldStep: 6,        // 噪声场抽样步长（内部像素）【性能】原 3
@@ -538,3 +542,10 @@ function render_noise_shader(ctx, areas, t, w, h, ox, oy) {
     ctx.drawImage(ns_out_cv, 0, 0, pw, ph, 0, 0, w, h);
     ctx.restore();
 }
+// 【关键修复】把入口显式挂到 window。
+// 之前 render_noise_shader 只是顶层函数声明，靠「全局词法作用域」被 noise_render.js 看见；
+// 一旦两个脚本被分包、被包进 IIFE、或加载顺序/上下文有偏差，就会出现
+// 「main.js 正常、噪域完全不画、还不报错」的假死现象。
+// 显式挂载后，noise_render.js 通过 window.render_noise_shader 一定能拿到。
+window.render_noise_shader = render_noise_shader;
+window.NOISE_SHADER = NOISE_SHADER;
